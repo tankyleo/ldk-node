@@ -1407,7 +1407,7 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 		// TODO: Zero-fee commitment channels are anchor channels, but do not allocate any
 		// funds to the anchor, so this will need to be updated when we ship these channels
 		// in ldk-node.
-		let node_a_anchors_msat = if expect_anchor_channel { 2 * 330 * 1000 } else { 0 };
+		let node_a_anchors_msat = if expect_anchor_channel { 0 } else { 0 };
 		let funding_amount_msat = node_a.list_channels()[0].channel_value_sats * 1000;
 		// Node B does not have any reserve, so we only subtract a few items on node A's
 		// side to arrive at node B's capacity
