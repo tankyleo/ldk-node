@@ -153,3 +153,6 @@ check-cfg = [
 [[bench]]
 name = "payments"
 harness = false
+
+[patch.crates-io]
+esplora-client = { git = 'https://github.com/acidbunny21/rust-esplora-client.git', branch = 'submit-tx-pkg-clients' }
