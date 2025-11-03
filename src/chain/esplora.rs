@@ -16,7 +16,9 @@ use lightning::chain::{Confirm, Filter, WatchedOutput};
 use lightning::util::ser::Writeable;
 use lightning_transaction_sync::EsploraSyncClient;
 
-use super::{periodically_archive_fully_resolved_monitors, WalletSyncStatus};
+use super::{
+	periodically_archive_fully_resolved_monitors, topologically_sort_single_child, WalletSyncStatus,
+};
 use crate::config::{
 	Config, EsploraSyncConfig, BDK_CLIENT_CONCURRENCY, BDK_CLIENT_STOP_GAP,
 	BDK_WALLET_SYNC_TIMEOUT_SECS, DEFAULT_ESPLORA_CLIENT_TIMEOUT_SECS,
@@ -364,7 +366,7 @@ impl EsploraChainSource {
 		Ok(())
 	}
 
-	pub(crate) async fn process_broadcast_package(&self, package: Vec<Transaction>) {
+	pub(crate) async fn process_broadcast_package(&self, mut package: Vec<Transaction>) {
 		if package.len() == 1 {
 			let tx = &package[0];
 			let txid = tx.compute_txid();
@@ -435,6 +437,7 @@ impl EsploraChainSource {
 				},
 			}
 		} else if package.len() > 1 {
+			topologically_sort_single_child(&mut package);
 			let txids: Vec<_> = package.iter().map(|tx| tx.compute_txid()).collect();
 			let timeout_fut = tokio::time::timeout(
 				Duration::from_secs(TX_BROADCAST_TIMEOUT_SECS),

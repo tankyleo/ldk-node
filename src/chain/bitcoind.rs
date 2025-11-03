@@ -28,7 +28,9 @@ use lightning_block_sync::{
 };
 use serde::Serialize;
 
-use super::{periodically_archive_fully_resolved_monitors, WalletSyncStatus};
+use super::{
+	periodically_archive_fully_resolved_monitors, topologically_sort_single_child, WalletSyncStatus,
+};
 use crate::config::{
 	BitcoindRestClientConfig, Config, FEE_RATE_CACHE_UPDATE_TIMEOUT_SECS, TX_BROADCAST_TIMEOUT_SECS,
 };
@@ -581,7 +583,7 @@ impl BitcoindChainSource {
 		Ok(())
 	}
 
-	pub(crate) async fn process_broadcast_package(&self, package: Vec<Transaction>) {
+	pub(crate) async fn process_broadcast_package(&self, mut package: Vec<Transaction>) {
 		if package.len() == 1 {
 			let tx = &package[0];
 			let txid = tx.compute_txid();
@@ -619,6 +621,7 @@ impl BitcoindChainSource {
 				},
 			}
 		} else if package.len() > 1 {
+			topologically_sort_single_child(&mut package);
 			let txids: Vec<_> = package.iter().map(|tx| tx.compute_txid()).collect();
 			let timeout_fut = tokio::time::timeout(
 				Duration::from_secs(TX_BROADCAST_TIMEOUT_SECS),
