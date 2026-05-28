@@ -40,8 +40,30 @@ pub(super) struct EsploraChainSource {
 	node_metrics: Arc<RwLock<NodeMetrics>>,
 }
 
+fn dummy_transaction() -> Transaction {
+	Transaction {
+		version: bitcoin::transaction::Version::TWO,
+		lock_time: bitcoin::absolute::LockTime::ZERO,
+		input: vec![bitcoin::TxIn {
+			previous_output: bitcoin::OutPoint {
+				txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::from_byte_array(
+					[0u8; 32],
+				)),
+				vout: 0,
+			},
+			sequence: bitcoin::Sequence::MAX,
+			script_sig: bitcoin::ScriptBuf::new(),
+			witness: bitcoin::Witness::new(),
+		}],
+		output: vec![bitcoin::TxOut {
+			script_pubkey: bitcoin::ScriptBuf::new(),
+			value: bitcoin::Amount::ZERO,
+		}],
+	}
+}
+
 impl EsploraChainSource {
-	pub(crate) fn new(
+	pub(crate) async fn new(
 		server_url: String, headers: HashMap<String, String>, sync_config: EsploraSyncConfig,
 		fee_estimator: Arc<OnchainFeeEstimator>, kv_store: Arc<DynStore>, config: Arc<Config>,
 		logger: Arc<Logger>, node_metrics: Arc<RwLock<NodeMetrics>>,
@@ -57,6 +79,15 @@ impl EsploraChainSource {
 		let esplora_client = client_builder.build_async().map_err(|e| {
 			log_error!(logger, "Failed to build Esplora client: {}", e);
 		})?;
+
+		if config.anchor_channels_config.is_some() {
+			esplora_client.submit_package(&[dummy_transaction()], None, None).await.map_err(
+				|e| {
+					log_error!(logger, "Esplora server does not support submit package: {:?}", e);
+				},
+			)?;
+		}
+
 		let tx_sync =
 			Arc::new(EsploraSyncClient::from_client(esplora_client.clone(), Arc::clone(&logger)));
 

@@ -96,7 +96,7 @@ enum ChainSourceKind {
 }
 
 impl ChainSource {
-	pub(crate) fn new_esplora(
+	pub(crate) async fn new_esplora(
 		server_url: String, headers: HashMap<String, String>, sync_config: EsploraSyncConfig,
 		fee_estimator: Arc<OnchainFeeEstimator>, tx_broadcaster: Arc<Broadcaster>,
 		kv_store: Arc<DynStore>, config: Arc<Config>, logger: Arc<Logger>,
@@ -111,7 +111,8 @@ impl ChainSource {
 			config,
 			Arc::clone(&logger),
 			node_metrics,
-		)?;
+		)
+		.await?;
 		let kind = ChainSourceKind::Esplora(esplora_chain_source);
 		let registered_txids = Mutex::new(Vec::new());
 		Ok((Self { kind, registered_txids, tx_broadcaster, logger }, None))
@@ -142,7 +143,7 @@ impl ChainSource {
 		fee_estimator: Arc<OnchainFeeEstimator>, tx_broadcaster: Arc<Broadcaster>,
 		kv_store: Arc<DynStore>, config: Arc<Config>, logger: Arc<Logger>,
 		node_metrics: Arc<RwLock<NodeMetrics>>,
-	) -> (Self, Option<BlockLocator>) {
+	) -> Result<(Self, Option<BlockLocator>), ()> {
 		let bitcoind_chain_source = BitcoindChainSource::new_rpc(
 			rpc_host,
 			rpc_port,
@@ -153,11 +154,12 @@ impl ChainSource {
 			config,
 			Arc::clone(&logger),
 			node_metrics,
-		);
+		)
+		.await?;
 		let best_block = bitcoind_chain_source.poll_best_block().await.ok();
 		let kind = ChainSourceKind::Bitcoind(bitcoind_chain_source);
 		let registered_txids = Mutex::new(Vec::new());
-		(Self { kind, registered_txids, tx_broadcaster, logger }, best_block)
+		Ok((Self { kind, registered_txids, tx_broadcaster, logger }, best_block))
 	}
 
 	pub(crate) async fn new_bitcoind_rest(
@@ -165,7 +167,7 @@ impl ChainSource {
 		fee_estimator: Arc<OnchainFeeEstimator>, tx_broadcaster: Arc<Broadcaster>,
 		kv_store: Arc<DynStore>, config: Arc<Config>, rest_client_config: BitcoindRestClientConfig,
 		logger: Arc<Logger>, node_metrics: Arc<RwLock<NodeMetrics>>,
-	) -> (Self, Option<BlockLocator>) {
+	) -> Result<(Self, Option<BlockLocator>), ()> {
 		let bitcoind_chain_source = BitcoindChainSource::new_rest(
 			rpc_host,
 			rpc_port,
@@ -177,11 +179,12 @@ impl ChainSource {
 			rest_client_config,
 			Arc::clone(&logger),
 			node_metrics,
-		);
+		)
+		.await?;
 		let best_block = bitcoind_chain_source.poll_best_block().await.ok();
 		let kind = ChainSourceKind::Bitcoind(bitcoind_chain_source);
 		let registered_txids = Mutex::new(Vec::new());
-		(Self { kind, registered_txids, tx_broadcaster, logger }, best_block)
+		Ok((Self { kind, registered_txids, tx_broadcaster, logger }, best_block))
 	}
 
 	pub(crate) fn start(&self, runtime: Arc<Runtime>) -> Result<(), Error> {

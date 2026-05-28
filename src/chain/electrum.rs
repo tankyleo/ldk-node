@@ -387,6 +387,28 @@ struct ElectrumRuntimeClient {
 	logger: Arc<Logger>,
 }
 
+fn dummy_transaction() -> Transaction {
+	Transaction {
+		version: bitcoin::transaction::Version::TWO,
+		lock_time: bitcoin::absolute::LockTime::ZERO,
+		input: vec![bitcoin::TxIn {
+			previous_output: bitcoin::OutPoint {
+				txid: bitcoin::Txid::from_raw_hash(bitcoin::hashes::Hash::from_byte_array(
+					[0u8; 32],
+				)),
+				vout: 0,
+			},
+			sequence: bitcoin::Sequence::MAX,
+			script_sig: bitcoin::ScriptBuf::new(),
+			witness: bitcoin::Witness::new(),
+		}],
+		output: vec![bitcoin::TxOut {
+			script_pubkey: bitcoin::ScriptBuf::new(),
+			value: bitcoin::Amount::ZERO,
+		}],
+	}
+}
+
 impl ElectrumRuntimeClient {
 	fn new(
 		server_url: String, sync_config: ElectrumSyncConfig, runtime: Arc<Runtime>,
@@ -405,6 +427,12 @@ impl ElectrumRuntimeClient {
 				Error::ConnectionFailed
 			})?,
 		);
+		if config.anchor_channels_config.is_some() {
+			electrum_client.transaction_broadcast_package(&[dummy_transaction()]).map_err(|e| {
+				log_error!(logger, "Electrum server does not support submit package: {:?}", e);
+				Error::ConnectionFailed
+			})?;
+		}
 		let bdk_electrum_client = Arc::new(BdkElectrumClient::new(Arc::clone(&electrum_client)));
 		let tx_sync = Arc::new(
 			ElectrumSyncClient::new(server_url.clone(), Arc::clone(&logger)).map_err(|e| {
