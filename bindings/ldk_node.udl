@@ -232,6 +232,7 @@ enum NodeError {
 	"LnurlAuthFailed",
 	"LnurlAuthTimeout",
 	"InvalidLnurl",
+	"ChainSourceNotSupported",
 };
 
 typedef dictionary NodeStatus;
