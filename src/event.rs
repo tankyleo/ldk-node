@@ -1276,7 +1276,7 @@ where
 					return Ok(());
 				}
 
-				let required_reserve_sats = crate::new_channel_anchor_reserve_sats(
+				let required_reserve_sats = crate::anchor_reserve_sats_for_peer(
 					&self.config,
 					&counterparty_node_id,
 					anchor_channel,
