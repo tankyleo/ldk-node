@@ -161,7 +161,9 @@ use lightning_background_processor::process_events_async;
 pub use lightning_invoice;
 pub use lightning_liquidity;
 pub use lightning_types;
-use lightning_types::features::NodeFeatures as LdkNodeFeatures;
+use lightning_types::features::{
+	ChannelTypeFeatures as LdkChannelTypeFeatures, NodeFeatures as LdkNodeFeatures,
+};
 use liquidity::LiquiditySource;
 use lnurl_auth::LnurlAuth;
 use logger::{log_debug, log_error, log_info, log_trace, LdkLogger, Logger};
@@ -1355,7 +1357,7 @@ impl Node {
 			.init_features;
 		let anchor_channel = init_features.supports_anchors_zero_fee_htlc_tx()
 			|| init_features.supports_anchor_zero_fee_commitments();
-		Ok(new_channel_anchor_reserve_sats(&self.config, peer_node_id, anchor_channel))
+		Ok(anchor_reserve_sats_for_peer(&self.config, peer_node_id, anchor_channel))
 	}
 
 	fn check_sufficient_funds_for_channel(
@@ -1383,6 +1385,23 @@ impl Node {
 			log_error!(self.logger,
 				"Unable to create channel due to insufficient funds. Available: {}sats, Required: {}sats",
 				spendable_amount_sats, required_funds_sats
+			);
+			return Err(Error::InsufficientFunds);
+		}
+
+		Ok(())
+	}
+
+	fn check_sufficient_funds_for_splice_in(&self, amount_sats: u64) -> Result<(), Error> {
+		let cur_anchor_reserve_sats =
+			total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
+		let spendable_amount_sats =
+			self.wallet.get_spendable_amount_sats(cur_anchor_reserve_sats).unwrap_or(0);
+
+		if spendable_amount_sats < amount_sats {
+			log_error!(self.logger,
+				"Unable to splice channel due to insufficient funds. Available: {}sats, Required: {}sats",
+				spendable_amount_sats, amount_sats
 			);
 			return Err(Error::InsufficientFunds);
 		}
@@ -1660,7 +1679,7 @@ impl Node {
 				},
 			};
 
-			self.check_sufficient_funds_for_channel(splice_amount_sats, &counterparty_node_id)?;
+			self.check_sufficient_funds_for_splice_in(splice_amount_sats)?;
 
 			let funding_template = self
 				.channel_manager
@@ -2309,25 +2328,34 @@ impl_writeable_tlv_based!(NodeMetrics, {
 pub(crate) fn total_anchor_channels_reserve_sats(
 	channel_manager: &ChannelManager, config: &Config,
 ) -> u64 {
-	config.anchor_channels_config.as_ref().map_or(0, |anchor_channels_config| {
+	config.anchor_channels_config.as_ref().map_or(0, |_| {
 		channel_manager
 			.list_channels()
 			.into_iter()
-			.filter(|c| {
-				!anchor_channels_config.trusted_peers_no_reserve.contains(&c.counterparty.node_id)
-					&& c.channel_shutdown_state
-						.map_or(true, |s| s != ChannelShutdownState::ShutdownComplete)
-					&& c.channel_type.as_ref().map_or(false, |t| {
-						t.requires_anchors_zero_fee_htlc_tx()
-							|| t.requires_anchor_zero_fee_commitments()
-					})
-			})
-			.count() as u64
-			* anchor_channels_config.per_channel_reserve_sats
+			.map(|c| channel_anchor_reserve_sats(config, &c))
+			.sum()
 	})
 }
 
-pub(crate) fn new_channel_anchor_reserve_sats(
+fn channel_anchor_reserve_sats(config: &Config, channel_details: &LdkChannelDetails) -> u64 {
+	let channel_is_shutdown_complete = channel_details
+		.channel_shutdown_state
+		.map_or(false, |s| s == ChannelShutdownState::ShutdownComplete);
+	if channel_is_shutdown_complete {
+		return 0;
+	}
+
+	let anchor_channel =
+		channel_details.channel_type.as_ref().map_or(false, is_anchor_channel_type);
+	anchor_reserve_sats_for_peer(config, &channel_details.counterparty.node_id, anchor_channel)
+}
+
+fn is_anchor_channel_type(channel_type: &LdkChannelTypeFeatures) -> bool {
+	channel_type.supports_anchors_zero_fee_htlc_tx()
+		|| channel_type.supports_anchor_zero_fee_commitments()
+}
+
+pub(crate) fn anchor_reserve_sats_for_peer(
 	config: &Config, peer_node_id: &PublicKey, anchor_channel: bool,
 ) -> u64 {
 	if !anchor_channel {

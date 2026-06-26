@@ -3235,6 +3235,92 @@ async fn open_channel_with_all_without_anchors() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn splice_in_with_all_does_not_require_new_anchor_reserve() {
+	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
+	let chain_source = random_chain_source(&bitcoind, &electrsd);
+	let (node_a, node_b) = setup_two_nodes(&chain_source, false, true, false);
+
+	let addr_a = node_a.onchain_payment().new_address().unwrap();
+	let addr_b = node_b.onchain_payment().new_address().unwrap();
+
+	let anchor_reserve_sat = 25_000;
+	let reserve_margin_sat = 1_000;
+	let premine_amount_sat = 5_000_000;
+	let channel_amount_sat = 1_000_000;
+
+	premine_and_distribute_funds(
+		&bitcoind.client,
+		&electrsd.client,
+		vec![addr_a, addr_b],
+		Amount::from_sat(premine_amount_sat),
+	)
+	.await;
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+
+	let funding_txo = open_channel(&node_a, &node_b, channel_amount_sat, false, &electrsd).await;
+
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
+
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+
+	let user_channel_id_a = expect_channel_ready_event!(node_a, node_b.node_id());
+	let _user_channel_id_b = expect_channel_ready_event!(node_b, node_a.node_id());
+
+	let channels = node_a.list_channels();
+	assert_eq!(channels.len(), 1);
+	let channel = &channels[0];
+	assert_eq!(channel.channel_value_sats, channel_amount_sat);
+	assert_eq!(channel.funding_txo.unwrap(), funding_txo);
+	assert_eq!(channel.reserve_type, Some(ReserveType::Adaptive));
+	assert!(channel.counterparty.features.supports_anchors_zero_fee_htlc_tx());
+	assert!(!channel.counterparty.features.requires_anchors_zero_fee_htlc_tx());
+
+	let balances_before_splice = node_a.list_balances();
+	assert_eq!(balances_before_splice.total_anchor_channels_reserve_sats, anchor_reserve_sat);
+	assert!(balances_before_splice.spendable_onchain_balance_sats > anchor_reserve_sat);
+
+	node_a.splice_in_with_all(&user_channel_id_a, node_b.node_id()).unwrap();
+
+	let splice_txo = expect_splice_negotiated_event!(node_a, node_b.node_id());
+	expect_splice_negotiated_event!(node_b, node_a.node_id());
+	wait_for_tx(&electrsd.client, splice_txo.txid).await;
+
+	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
+
+	node_a.sync_wallets().unwrap();
+	node_b.sync_wallets().unwrap();
+
+	let _user_channel_id_a2 = expect_channel_ready_event!(node_a, node_b.node_id());
+	let _user_channel_id_b2 = expect_channel_ready_event!(node_b, node_a.node_id());
+
+	let balances_after_splice = node_a.list_balances();
+	assert!(
+		balances_after_splice.total_onchain_balance_sats >= anchor_reserve_sat - reserve_margin_sat
+			&& balances_after_splice.total_onchain_balance_sats
+				<= anchor_reserve_sat + reserve_margin_sat,
+		"total on-chain balance {} should remain close to anchor reserve {anchor_reserve_sat}",
+		balances_after_splice.total_onchain_balance_sats
+	);
+	assert!(
+		balances_after_splice.spendable_onchain_balance_sats <= reserve_margin_sat,
+		"spendable on-chain balance {} should be close to zero",
+		balances_after_splice.spendable_onchain_balance_sats
+	);
+	assert!(
+		balances_after_splice.total_anchor_channels_reserve_sats
+			>= anchor_reserve_sat - reserve_margin_sat
+			&& balances_after_splice.total_anchor_channels_reserve_sats <= anchor_reserve_sat,
+		"anchor reserve {} should remain close to {anchor_reserve_sat}",
+		balances_after_splice.total_anchor_channels_reserve_sats
+	);
+
+	node_a.stop().unwrap();
+	node_b.stop().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn splice_in_with_all_balance() {
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
 	let chain_source = random_chain_source(&bitcoind, &electrsd);
