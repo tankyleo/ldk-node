@@ -161,7 +161,7 @@ use lightning_background_processor::process_events_async;
 pub use lightning_invoice;
 pub use lightning_liquidity;
 pub use lightning_types;
-use lightning_types::features::NodeFeatures as LdkNodeFeatures;
+use lightning_types::features::{ChannelTypeFeatures, NodeFeatures as LdkNodeFeatures};
 use liquidity::LiquiditySource;
 use lnurl_auth::LnurlAuth;
 use logger::{log_debug, log_error, log_info, log_trace, LdkLogger, Logger};
@@ -212,6 +212,11 @@ impl LeakChecker {
 			assert_eq!(weak.strong_count(), 0);
 		}
 	}
+}
+
+pub(crate) fn requires_anchor_channel_type(channel_type: &ChannelTypeFeatures) -> bool {
+	channel_type.requires_anchors_zero_fee_htlc_tx()
+		|| channel_type.requires_anchor_zero_fee_commitments()
 }
 
 /// The main interface object of LDK Node, wrapping the necessary LDK and BDK functionalities.
@@ -285,15 +290,28 @@ impl Node {
 			e
 		})?;
 
-		let any_current_0fc_channels =
-			self.chain_monitor.list_monitors().into_iter().any(|channel_id| {
+		let any_current_anchor_channels =
+			self.channel_manager.list_channels().into_iter().any(|channel| {
+				channel
+					.channel_shutdown_state
+					.map_or(true, |s| s != ChannelShutdownState::ShutdownComplete)
+					&& channel.channel_type.as_ref().map_or(false, requires_anchor_channel_type)
+			}) || self.chain_monitor.list_monitors().into_iter().any(|channel_id| {
 				self.chain_monitor
 					.get_monitor(channel_id)
-					.map(|monitor| {
-						monitor.channel_type_features().requires_anchor_zero_fee_commitments()
-					})
+					.map(|monitor| requires_anchor_channel_type(&monitor.channel_type_features()))
 					.unwrap_or(false)
 			});
+
+		if any_current_anchor_channels && self.config.anchor_channels_config.is_none() {
+			log_error!(
+				self.logger,
+				"Cannot remove the anchor channels config while anchor channels \
+				are still open or unresolved. You must close and resolve all anchor \
+				channels before disabling anchor channels."
+			);
+			return Err(Error::ChannelConfigUpdateFailed);
+		}
 
 		// Block to ensure we update our fee rate cache once on startup.
 		// Also take this opportunity to make sure our chain source supports any current or
@@ -303,7 +321,7 @@ impl Node {
 			tokio::try_join!(
 				chain_source.update_fee_rate_estimates(),
 				chain_source.validate_zero_fee_commitments_support_if_required(
-					any_current_0fc_channels || self.config.anchor_channels_config.is_some()
+					self.config.anchor_channels_config.is_some()
 				)
 			)
 		})?;
@@ -2334,10 +2352,7 @@ pub(crate) fn total_anchor_channels_reserve_sats(
 				!anchor_channels_config.trusted_peers_no_reserve.contains(&c.counterparty.node_id)
 					&& c.channel_shutdown_state
 						.map_or(true, |s| s != ChannelShutdownState::ShutdownComplete)
-					&& c.channel_type.as_ref().map_or(false, |t| {
-						t.requires_anchors_zero_fee_htlc_tx()
-							|| t.requires_anchor_zero_fee_commitments()
-					})
+					&& c.channel_type.as_ref().map_or(false, requires_anchor_channel_type)
 			})
 			.count() as u64
 			* anchor_channels_config.per_channel_reserve_sats
