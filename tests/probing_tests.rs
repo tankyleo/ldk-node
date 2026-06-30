@@ -126,10 +126,10 @@ async fn probe_budget_increments_and_decrements() {
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
 	let chain_source = random_chain_source(&bitcoind, &electrsd);
 
-	let node_b = setup_node(&chain_source, random_config(false));
-	let node_c = setup_node(&chain_source, random_config(false));
+	let node_b = setup_node(&chain_source, random_config());
+	let node_c = setup_node(&chain_source, random_config());
 
-	let mut config_a = random_config(false);
+	let mut config_a = random_config();
 	let strategy = FixedPathStrategy::new();
 	config_a.probing = Some(
 		ProbingConfigBuilder::custom(strategy.clone())
@@ -219,10 +219,10 @@ async fn locked_msat_accounts_for_routing_fees() {
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
 	let chain_source = random_chain_source(&bitcoind, &electrsd);
 
-	let node_b = setup_node(&chain_source, random_config(false));
-	let node_c = setup_node(&chain_source, random_config(false));
+	let node_b = setup_node(&chain_source, random_config());
+	let node_c = setup_node(&chain_source, random_config());
 
-	let mut config_a = random_config(false);
+	let mut config_a = random_config();
 	let strategy = FixedPathStrategy::new();
 	config_a.probing = Some(
 		ProbingConfigBuilder::custom(strategy.clone())
@@ -308,10 +308,10 @@ async fn probing_budget_restored_after_node_restart() {
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
 	let chain_source = random_chain_source(&bitcoind, &electrsd);
 
-	let node_b = setup_node(&chain_source, random_config(false));
-	let node_c = setup_node(&chain_source, random_config(false));
+	let node_b = setup_node(&chain_source, random_config());
+	let node_c = setup_node(&chain_source, random_config());
 
-	let mut config_a = random_config(false);
+	let mut config_a = random_config();
 	// Use a pure on-disk store so state survives the restart.
 	config_a.store_type = TestStoreType::Sqlite;
 	let strategy = FixedPathStrategy::new();
@@ -409,10 +409,10 @@ async fn exhausted_probe_budget_blocks_new_probes() {
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
 	let chain_source = random_chain_source(&bitcoind, &electrsd);
 
-	let node_b = setup_node(&chain_source, random_config(false));
-	let node_c = setup_node(&chain_source, random_config(false));
+	let node_b = setup_node(&chain_source, random_config());
+	let node_c = setup_node(&chain_source, random_config());
 
-	let mut config_a = random_config(false);
+	let mut config_a = random_config();
 	let strategy = FixedPathStrategy::new();
 	let max_locked_msat = 2 * PROBE_AMOUNT_MSAT;
 	config_a.probing = Some(
