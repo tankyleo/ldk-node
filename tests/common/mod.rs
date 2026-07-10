@@ -1709,11 +1709,6 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 		);
 		assert_any_node_has_onchain_tx_type(
 			&[("node_a", &node_a), ("node_b", &node_b)],
-			"UnilateralClose",
-			|tx_type| matches!(tx_type, TransactionType::UnilateralClose { .. }),
-		);
-		assert_any_node_has_onchain_tx_type(
-			&[("node_a", &node_a), ("node_b", &node_b)],
 			"Sweep",
 			|tx_type| matches!(tx_type, TransactionType::Sweep { .. }),
 		);

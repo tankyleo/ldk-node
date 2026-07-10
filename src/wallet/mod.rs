@@ -1338,7 +1338,9 @@ impl Wallet {
 		let txid = tx.compute_txid();
 		let (amount_msat, fee_paid_msat, direction) = self.onchain_payment_fields(tx);
 
-		if amount_msat == Some(0) && fee_paid_msat == Some(0) {
+		if (amount_msat == Some(0) && fee_paid_msat == Some(0))
+			|| matches!(tx_type, TransactionType::UnilateralClose { .. })
+		{
 			log_trace!(
 				self.logger,
 				"Not recording classified broadcast {} as a payment: no wallet-level activity",
