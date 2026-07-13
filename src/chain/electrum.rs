@@ -637,11 +637,11 @@ impl ElectrumRuntimeClient {
 		let electrum_client = Arc::clone(&self.electrum_client);
 
 		let txid = tx.compute_txid();
-		let tx = Arc::new([tx]);
+		let tx = Arc::new(tx);
 
 		let spawn_fut = self.runtime.spawn_blocking({
 			let tx = Arc::clone(&tx);
-			move || electrum_client.transaction_broadcast(tx.first().expect("The length is 1"))
+			move || electrum_client.transaction_broadcast(tx.as_ref())
 		});
 		let timeout_fut = tokio::time::timeout(
 			Duration::from_secs(self.sync_config.timeouts_config.tx_broadcast_timeout_secs),
@@ -653,10 +653,12 @@ impl ElectrumRuntimeClient {
 				Ok(Ok(txid)) => {
 					log_trace!(self.logger, "Successfully broadcast transaction {}", txid);
 				},
-				Ok(Err(e)) => self.log_broadcast_error(e, &[txid], tx.as_ref()),
-				Err(e) => self.log_broadcast_error(e, &[txid], tx.as_ref()),
+				Ok(Err(e)) => {
+					self.log_broadcast_error(e, &[txid], core::slice::from_ref(tx.as_ref()))
+				},
+				Err(e) => self.log_broadcast_error(e, &[txid], core::slice::from_ref(tx.as_ref())),
 			},
-			Err(e) => self.log_broadcast_error(e, &[txid], tx.as_ref()),
+			Err(e) => self.log_broadcast_error(e, &[txid], core::slice::from_ref(tx.as_ref())),
 		}
 	}
 
