@@ -24,28 +24,24 @@ const BCAST_PACKAGE_QUEUE_SIZE: usize = 50;
 /// call, along with each transaction's type. Queued until the background task classifies and
 /// broadcasts it. Built only via [`BroadcastPackage::new`] from such a call, so unrelated
 /// transactions can't be grouped into one package by accident.
-pub(crate) struct BroadcastPackage(Vec<(Transaction, Option<LdkTransactionType>)>);
+pub(crate) struct BroadcastPackage(Vec<Transaction>, Vec<Option<LdkTransactionType>>);
 
 impl BroadcastPackage {
 	/// Builds a package from the transactions of a single `broadcast_transactions` call.
 	fn new(txs: &[(&Transaction, LdkTransactionType)]) -> Self {
-		Self(txs.iter().map(|(tx, tx_type)| ((*tx).clone(), Some(tx_type.clone()))).collect())
+		let (txs, types) =
+			txs.iter().map(|(tx, tx_type)| ((*tx).clone(), Some(tx_type.clone()))).unzip();
+		Self(txs, types)
 	}
 
 	/// Builds a package for wallet-originated broadcasts that have no LDK classification.
 	fn unclassified(tx: Transaction) -> Self {
-		Self(vec![(tx, None)])
-	}
-
-	/// The packaged transactions and their types, for classification.
-	fn transactions(&self) -> &[(Transaction, Option<LdkTransactionType>)] {
-		&self.0
+		Self(vec![tx], vec![None])
 	}
 
 	/// Consumes the package into its transactions, ready for the chain client.
 	pub(crate) fn into_sorted_transactions(self) -> SortedTransactions {
-		let txs = self.0.into_iter().map(|(tx, _)| tx).collect();
-		SortedTransactions::sort_parents_child_package_topologically(txs)
+		SortedTransactions::sort_parents_child_package_topologically(self.0)
 	}
 }
 
@@ -141,7 +137,7 @@ where
 	) -> Result<BroadcastPackage, Error> {
 		let wallet_opt = self.wallet.lock().expect("lock").as_ref().and_then(Weak::upgrade);
 		if let Some(wallet) = wallet_opt {
-			for (tx, tx_type) in package.transactions() {
+			for (tx, tx_type) in package.0.iter().zip(package.1.iter()) {
 				if let Some(tx_type) = tx_type {
 					wallet.classify_broadcast(tx, tx_type).await?;
 				}
