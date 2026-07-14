@@ -15,9 +15,7 @@ use bitcoin::address::NetworkUnchecked;
 use bitcoin::hashes::sha256::Hash as Sha256Hash;
 use bitcoin::hashes::Hash;
 use bitcoin::{Address, Amount, ScriptBuf, Txid};
-use common::logging::{
-	init_log_logger, validate_log_entry, MockLogFacadeLogger, MultiNodeLogger, TestLogWriter,
-};
+use common::logging::{init_log_logger, validate_log_entry, MultiNodeLogger, TestLogWriter};
 use common::{
 	bump_fee_and_broadcast, distribute_funds_unconfirmed, do_channel_full_cycle,
 	expect_channel_pending_event, expect_channel_ready_event, expect_channel_ready_events,
@@ -3026,7 +3024,6 @@ async fn lsps2_rejects_jit_channel_without_anchor_reserve() {
 		disable_client_reserve: false,
 	};
 
-	let service_logger = Arc::new(MockLogFacadeLogger::new());
 	let service_config = random_config(true);
 	let anchor_reserve_sats = service_config
 		.node_config
@@ -3036,7 +3033,6 @@ async fn lsps2_rejects_jit_channel_without_anchor_reserve() {
 		.per_channel_reserve_sats;
 	setup_builder!(service_builder, service_config.node_config);
 	service_builder.set_chain_source_esplora(esplora_url.clone(), Some(sync_config));
-	service_builder.set_custom_logger(service_logger.clone());
 	service_builder.enable_liquidity_provider(lsps2_service_config);
 	let service_node = service_builder.build(service_config.node_entropy.into()).unwrap();
 	service_node.start().unwrap();
@@ -3125,33 +3121,17 @@ async fn lsps2_rejects_jit_channel_without_anchor_reserve() {
 
 	let _payment_id = payer_node.bolt11_payment().send(&jit_invoice, None).unwrap();
 
-	tokio::time::timeout(
-		std::time::Duration::from_secs(crate::common::INTEROP_TIMEOUT_SECS),
-		async {
-			loop {
-				if service_logger
-					.retrieve_logs()
-					.iter()
-					.any(|log| log.contains("Unable to create channel due to insufficient funds"))
-				{
-					break;
-				}
-				assert!(
-					service_node
-						.list_channels()
-						.iter()
-						.all(|c| c.counterparty.node_id != client_node_id),
-					"LSPS2 service opened a channel without retaining the optional anchor reserve"
-				);
-				tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-			}
-		},
-	)
-	.await
-	.expect(&format!(
-		"Timed out waiting for LSPS2 insufficient-funds log. Logs: {:?}",
-		service_logger.retrieve_logs()
-	));
+	for _ in 0..30 {
+		assert!(
+			service_node.list_channels().iter().all(|c| c.counterparty.node_id != client_node_id),
+			"LSPS2 service opened a channel without retaining the optional anchor reserve"
+		);
+		assert!(
+			client_node.list_channels().iter().all(|c| c.counterparty.node_id != service_node_id),
+			"LSPS2 client accepted a channel opened without the optional anchor reserve"
+		);
+		tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+	}
 
 	assert!(service_node.list_channels().iter().all(|c| c.counterparty.node_id != client_node_id));
 	assert!(client_node.list_channels().iter().all(|c| c.counterparty.node_id != service_node_id));

@@ -61,23 +61,6 @@ impl LogWriter for MockLogFacadeLogger {
 	}
 }
 
-#[cfg(feature = "uniffi")]
-impl LogWriter for MockLogFacadeLogger {
-	fn log(&self, record: LogRecord) {
-		let level = MockLogLevel(record.level).into();
-		let mut record_builder = log::Record::builder();
-		LogFacadeLog::log(
-			self,
-			&record_builder
-				.level(level)
-				.module_path(Some(&record.module_path))
-				.line(Some(record.line))
-				.args(format_args!("{}", record.args))
-				.build(),
-		);
-	}
-}
-
 #[cfg(not(feature = "uniffi"))]
 struct MockLogRecord<'a>(LogRecord<'a>);
 struct MockLogLevel(LogLevel);
