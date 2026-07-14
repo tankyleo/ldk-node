@@ -382,10 +382,10 @@ pub(crate) fn random_node_alias() -> Option<NodeAlias> {
 pub(crate) fn random_config() -> TestConfig {
 	let mut node_config = Config::default();
 
-	// We want 0FC channels to be negotiated half the time, 0.49 is good enough
-	let zero_fee_commitments = rand::random_bool(0.7);
-	println!("Negotiating zero-fee commitment channels: {}", zero_fee_commitments);
-	node_config.anchor_channels_config.enable_zero_fee_commitments = zero_fee_commitments;
+	#[cfg(zero_fee_commitment_tests)]
+	{
+		node_config.anchor_channels_config.enable_zero_fee_commitments = true;
+	}
 
 	node_config.network = Network::Regtest;
 	println!("Setting network: {}", node_config.network);
