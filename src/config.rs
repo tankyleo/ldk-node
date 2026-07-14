@@ -353,6 +353,8 @@ pub struct AnchorChannelsConfig {
 	/// chain source *must* support the `submitpackage` Bitcoin Core RPC, and relay TRUC, P2A,
 	/// and ephemeral dust.
 	/// See [BOLT 3] for more technical details.
+	///
+	/// [BOLT 3]: https://github.com/lightning/bolts/blob/master/03-transactions.md#shared_anchor-output-zero_fee_commitments
 	pub enable_zero_fee_commitments: bool,
 }
 
