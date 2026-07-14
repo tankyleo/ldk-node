@@ -291,7 +291,7 @@ impl Node {
 			e
 		})?;
 
-		let any_current_0fc_channels =
+		let manager_owns_any_0fc_channels =
 			self.channel_manager.list_channels().into_iter().any(|channel| {
 				channel
 					.channel_shutdown_state
@@ -300,7 +300,9 @@ impl Node {
 						.channel_type
 						.as_ref()
 						.map_or(false, |c| c.requires_anchor_zero_fee_commitments())
-			}) || self.chain_monitor.list_monitors().into_iter().any(|channel_id| {
+			});
+		let monitor_owns_any_0fc_channels =
+			self.chain_monitor.list_monitors().into_iter().any(|channel_id| {
 				self.chain_monitor
 					.get_monitor(channel_id)
 					.map(|monitor| {
@@ -308,7 +310,8 @@ impl Node {
 					})
 					.unwrap_or(false)
 			});
-		let zero_fee_commitments_support_required = any_current_0fc_channels
+		let zero_fee_commitments_support_required = manager_owns_any_0fc_channels
+			|| monitor_owns_any_0fc_channels
 			|| self.config.anchor_channels_config.enable_zero_fee_commitments;
 
 		// Block to ensure we update our fee rate cache once on startup.
