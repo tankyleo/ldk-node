@@ -346,12 +346,14 @@ pub struct AnchorChannelsConfig {
 	/// might not suffice to successfully spend the Anchor output and have the HTLC transactions
 	/// confirmed on-chain, i.e., you may want to adjust this value accordingly.
 	pub per_channel_reserve_sats: u64,
-	/// In addition to `option_anchors_zero_fee_htlc_tx`, we will also attempt to negotiate
-	/// `option_zero_fee_commitments`. Zero-fee commitment channels remove all commitment
-	/// feerate negotiation from the channel, and instead source *all* the fees required to
-	/// confirm the commitment from the anchor reserve at the time of broadcast. If set, your
-	/// chain source *must* support the `submitpackage` Bitcoin Core RPC, and relay TRUC, P2A,
-	/// and ephemeral dust.
+	/// If set, we will first attempt to negotiate `option_zero_fee_commitments` before falling
+	/// back to `option_anchors_zero_fee_htlc_tx` and `option_static_remotekey`, as supported by
+	/// the peer. Zero-fee commitment channels remove all commitment feerate negotiation from
+	/// the channel, which eliminates a very common source of channel force-closures. These
+	/// channels instead source *all* the fees required to confirm the commitment from the
+	/// anchor reserve of the channel closer at the time of force-close. If set, your chain
+	/// source *must* support the `submitpackage` Bitcoin Core RPC, and relay TRUC, P2A, and
+	/// ephemeral dust.
 	/// See [BOLT 3] for more technical details.
 	///
 	/// [BOLT 3]: https://github.com/lightning/bolts/blob/master/03-transactions.md#shared_anchor-output-zero_fee_commitments
