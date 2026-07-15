@@ -69,6 +69,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bitcoin::secp256k1::PublicKey;
+use lightning::ln::channel_state::OutboundHTLCStateDetails;
 use lightning::ln::channelmanager::{PaymentId, RecentPaymentDetails};
 use lightning::routing::gossip::NodeId;
 use lightning::routing::router::{
@@ -754,7 +755,7 @@ fn fmt_path(path: &lightning::routing::router::Path) -> String {
 impl Prober {
 	/// Returns the total millisatoshis currently locked in in-flight probes.
 	pub fn locked_msat(&self) -> u64 {
-		return self
+		let recent_probe_locked_msat = self
 			.channel_manager
 			.list_recent_payments()
 			.into_iter()
@@ -768,6 +769,30 @@ impl Prober {
 				_ => None,
 			})
 			.sum();
+
+		if recent_probe_locked_msat > 0 {
+			return recent_probe_locked_msat;
+		}
+
+		// After restart, LDK can expose a still-locked outbound HTLC through channel state
+		// before it exposes the matching pending probe payment again. ChannelDetails does
+		// not identify probe HTLCs, so fall back conservatively when no recent probe
+		// accounting is available.
+		self.channel_manager
+			.list_channels()
+			.into_iter()
+			.flat_map(|c| c.pending_outbound_htlcs)
+			.filter(|h| {
+				matches!(
+					h.state,
+					None | Some(
+						OutboundHTLCStateDetails::AwaitingRemoteRevokeToAdd
+							| OutboundHTLCStateDetails::Committed
+					)
+				)
+			})
+			.map(|h| h.amount_msat)
+			.sum()
 	}
 
 	pub(crate) fn handle_background_probe_successful(&self, path: &Path, payment_id: PaymentId) {

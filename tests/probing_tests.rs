@@ -17,7 +17,7 @@
 //   probing_budget_restored_after_node_restart
 //      Dispatches a probe, then stops node_b before the failure can propagate
 //      back so the pending probe HTLC is preserved. Restarts node_a and asserts
-//      the prober's locked_msat is rebuilt non-zero from list_recent_payments().
+//      the prober's locked_msat is rebuilt non-zero from persisted LDK state.
 
 mod common;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -298,8 +298,7 @@ async fn locked_msat_accounts_for_routing_fees() {
 /// faster than `node_b.stop()` — so any failure message from B is dropped before A
 /// processes it. If the race is lost on a given probe (locked_msat drops back to 0
 /// after the disconnect), we reconnect and let the next probe tick try again.
-/// The pending Probe entry persists in `node_a`'s channel manager and must be
-/// rebuilt by the prober's `locked_msat` on restart via `list_recent_payments()`.
+/// The pending probe must be rebuilt by the prober's `locked_msat` on restart.
 #[tokio::test(flavor = "multi_thread")]
 async fn probing_budget_restored_after_node_restart() {
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
@@ -319,7 +318,7 @@ async fn probing_budget_restored_after_node_restart() {
 			.build(),
 	);
 	let restart_config = config_a.clone();
-	let node_a = setup_node(&chain_source, config_a);
+	let mut node_a = setup_node(&chain_source, config_a);
 
 	let addr_a = node_a.onchain_payment().new_address().unwrap();
 	let addr_b = node_b.onchain_payment().new_address().unwrap();
@@ -355,39 +354,52 @@ async fn probing_budget_restored_after_node_restart() {
 	let node_b_id = node_b.node_id();
 	let node_b_addr = node_b.listening_addresses().unwrap().into_iter().next().unwrap();
 
-	strategy.start_probing();
-
 	// Dispatch a probe and isolate node_a from node_b before the failure can
 	// propagate back. Tight polling + in-process disconnect minimises the race
-	// window; on a lost race we reconnect and let the prober's next tick try.
-	let isolated = tokio::time::timeout(Duration::from_secs(30), async {
+	// window, but a failure may already be queued when we sample locked_msat.
+	// If the restart shows the probe resolved before persistence, retry with
+	// the restarted node and let the prober's next tick try again.
+	let (locked_before, locked_after) = tokio::time::timeout(Duration::from_secs(90), async {
 		loop {
-			if node_a.prober().unwrap().locked_msat() > 0 {
-				node_a.disconnect(node_b_id).ok();
-				if node_a.prober().unwrap().locked_msat() > 0 {
-					return true;
+			node_a.connect(node_b_id, node_b_addr.clone(), false).ok();
+			wait_for_channel_ready_to_send(&node_a, &node_b, PROBE_AMOUNT_MSAT + 1000).await;
+
+			strategy.start_probing();
+			let isolated = tokio::time::timeout(Duration::from_secs(30), async {
+				loop {
+					if node_a.prober().unwrap().locked_msat() > 0 {
+						node_a.disconnect(node_b_id).ok();
+						if node_a.prober().unwrap().locked_msat() > 0 {
+							return true;
+						}
+						node_a.connect(node_b_id, node_b_addr.clone(), false).ok();
+					}
+					tokio::time::sleep(Duration::from_millis(1)).await;
 				}
-				node_a.connect(node_b_id, node_b_addr.clone(), false).ok();
+			})
+			.await
+			.unwrap_or(false);
+			assert!(isolated, "could not preserve in-flight probe long enough to restart");
+			strategy.stop_probing();
+
+			let locked_before = node_a.prober().unwrap().locked_msat();
+			println!("Before restart: locked_msat = {}", locked_before);
+			assert!(locked_before > 0, "probe resolved before we could isolate node_a");
+
+			node_a.stop().unwrap();
+
+			// Restart node_a from the same persisted state.
+			node_a = setup_node(&chain_source, restart_config.clone());
+
+			let locked_after = node_a.prober().unwrap().locked_msat();
+			println!("After restart:  locked_msat = {}", locked_after);
+			if locked_after > 0 {
+				return (locked_before, locked_after);
 			}
-			tokio::time::sleep(Duration::from_millis(1)).await;
 		}
 	})
 	.await
-	.unwrap_or(false);
-	assert!(isolated, "could not preserve in-flight probe long enough to restart");
-	strategy.stop_probing();
-
-	let locked_before = node_a.prober().unwrap().locked_msat();
-	println!("Before restart: locked_msat = {}", locked_before);
-	assert!(locked_before > 0, "probe resolved before we could isolate node_a — flaky timing");
-
-	node_a.stop().unwrap();
-
-	// Restart node_a from the same persisted state.
-	let node_a = setup_node(&chain_source, restart_config);
-
-	let locked_after = node_a.prober().unwrap().locked_msat();
-	println!("After restart:  locked_msat = {}", locked_after);
+	.expect("could not preserve an in-flight probe across restart");
 	assert!(
 		locked_after > 0,
 		"locked_msat was not restored after restart (before={} after={})",
