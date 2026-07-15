@@ -36,7 +36,9 @@ use crate::liquidity::client::lsps2::LSPS2Client;
 use crate::liquidity::service::lsps2::{LSPS2Service, LSPS2ServiceLiquiditySource};
 use crate::logger::{log_debug, log_error, log_info, LdkLogger, Logger};
 use crate::runtime::Runtime;
-use crate::types::{Broadcaster, ChannelManager, DynStore, KeysManager, LiquidityManager, Wallet};
+use crate::types::{
+	Broadcaster, ChainMonitor, ChannelManager, DynStore, KeysManager, LiquidityManager, Wallet,
+};
 use crate::{Config, Error};
 
 const LIQUIDITY_REQUEST_TIMEOUT_SECS: u64 = 5;
@@ -203,6 +205,7 @@ where
 	lsps2_service: Option<LSPS2Service>,
 	wallet: Arc<Wallet>,
 	channel_manager: Arc<ChannelManager>,
+	chain_monitor: Arc<ChainMonitor>,
 	keys_manager: Arc<KeysManager>,
 	tx_broadcaster: Arc<Broadcaster>,
 	kv_store: Arc<DynStore>,
@@ -216,7 +219,8 @@ where
 {
 	pub(crate) fn new(
 		wallet: Arc<Wallet>, channel_manager: Arc<ChannelManager>, keys_manager: Arc<KeysManager>,
-		tx_broadcaster: Arc<Broadcaster>, kv_store: Arc<DynStore>, config: Arc<Config>, logger: L,
+		chain_monitor: Arc<ChainMonitor>, tx_broadcaster: Arc<Broadcaster>,
+		kv_store: Arc<DynStore>, config: Arc<Config>, logger: L,
 	) -> Self {
 		let lsp_nodes = Vec::new();
 		let lsps2_service = None;
@@ -225,6 +229,7 @@ where
 			lsps2_service,
 			wallet,
 			channel_manager,
+			chain_monitor,
 			keys_manager,
 			tx_broadcaster,
 			kv_store,
@@ -322,6 +327,7 @@ where
 				lsps2_service: self.lsps2_service,
 				wallet: self.wallet,
 				channel_manager: self.channel_manager,
+				chain_monitor: self.chain_monitor,
 				peer_manager: RwLock::new(None),
 				keys_manager: self.keys_manager,
 				liquidity_manager: Arc::clone(&liquidity_manager),

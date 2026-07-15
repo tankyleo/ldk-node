@@ -1636,6 +1636,27 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 	expect_event!(node_a, ChannelClosed);
 	expect_event!(node_b, ChannelClosed);
 
+	if force_close {
+		assert!(
+			node_a.list_channels().is_empty(),
+			"node_a should no longer list the force-closed channel"
+		);
+		assert!(
+			node_b.list_channels().is_empty(),
+			"node_b should no longer list the force-closed channel"
+		);
+		assert_eq!(
+			node_a.list_balances().total_anchor_channels_reserve_sats,
+			node_a_anchor_reserve_sat,
+			"node_a should retain its anchor reserve while the commitment is unconfirmed"
+		);
+		assert_eq!(
+			node_b.list_balances().total_anchor_channels_reserve_sats,
+			node_b_anchor_reserve_sat,
+			"node_b should retain its anchor reserve while the commitment is unconfirmed"
+		);
+	}
+
 	wait_for_outpoint_spend(electrsd, funding_txo_b).await;
 
 	generate_blocks_and_wait(&bitcoind, electrsd, 1).await;

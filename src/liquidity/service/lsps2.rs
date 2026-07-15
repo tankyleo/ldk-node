@@ -23,7 +23,9 @@ use lightning_liquidity::lsps2::service::LSPS2ServiceConfig as LdkLSPS2ServiceCo
 use lightning_types::payment::PaymentHash;
 
 use crate::logger::{log_error, LdkLogger};
-use crate::types::{ChannelManager, KeysManager, LiquidityManager, PeerManager, Wallet};
+use crate::types::{
+	ChainMonitor, ChannelManager, KeysManager, LiquidityManager, PeerManager, Wallet,
+};
 use crate::{total_anchor_channels_reserve_sats, Config};
 
 const LSPS2_GETINFO_REQUEST_EXPIRY: Duration = Duration::from_secs(60 * 60 * 24);
@@ -41,6 +43,7 @@ where
 	pub(crate) lsps2_service: Option<LSPS2Service>,
 	pub(crate) wallet: Arc<Wallet>,
 	pub(crate) channel_manager: Arc<ChannelManager>,
+	pub(crate) chain_monitor: Arc<ChainMonitor>,
 	pub(crate) peer_manager: RwLock<Option<Weak<PeerManager>>>,
 	pub(crate) keys_manager: Arc<KeysManager>,
 	pub(crate) liquidity_manager: Arc<LiquidityManager>,
@@ -448,8 +451,11 @@ where
 					* service_config.channel_over_provisioning_ppm as u64)
 					/ 1_000_000;
 				let channel_amount_sats = (amt_to_forward_msat + over_provisioning_msat) / 1000;
-				let cur_anchor_reserve_sats =
-					total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
+				let cur_anchor_reserve_sats = total_anchor_channels_reserve_sats(
+					&self.channel_manager,
+					&self.chain_monitor,
+					&self.config,
+				);
 				let spendable_amount_sats =
 					self.wallet.get_spendable_amount_sats(cur_anchor_reserve_sats).unwrap_or(0);
 				let anchor_channel =

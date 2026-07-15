@@ -15,7 +15,7 @@ use lightning::ln::channelmanager::PaymentId;
 use crate::config::Config;
 use crate::error::Error;
 use crate::logger::{log_info, LdkLogger, Logger};
-use crate::types::{ChannelManager, Wallet};
+use crate::types::{ChainMonitor, ChannelManager, Wallet};
 use crate::wallet::OnchainSendAmount;
 
 #[cfg(not(feature = "uniffi"))]
@@ -45,6 +45,7 @@ macro_rules! maybe_map_fee_rate_opt {
 pub struct OnchainPayment {
 	wallet: Arc<Wallet>,
 	channel_manager: Arc<ChannelManager>,
+	chain_monitor: Arc<ChainMonitor>,
 	config: Arc<Config>,
 	is_running: Arc<RwLock<bool>>,
 	logger: Arc<Logger>,
@@ -52,10 +53,11 @@ pub struct OnchainPayment {
 
 impl OnchainPayment {
 	pub(crate) fn new(
-		wallet: Arc<Wallet>, channel_manager: Arc<ChannelManager>, config: Arc<Config>,
-		is_running: Arc<RwLock<bool>>, logger: Arc<Logger>,
+		wallet: Arc<Wallet>, channel_manager: Arc<ChannelManager>,
+		chain_monitor: Arc<ChainMonitor>, config: Arc<Config>, is_running: Arc<RwLock<bool>>,
+		logger: Arc<Logger>,
 	) -> Self {
-		Self { wallet, channel_manager, config, is_running, logger }
+		Self { wallet, channel_manager, chain_monitor, config, is_running, logger }
 	}
 }
 
@@ -84,8 +86,11 @@ impl OnchainPayment {
 			return Err(Error::NotRunning);
 		}
 
-		let cur_anchor_reserve_sats =
-			crate::total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
+		let cur_anchor_reserve_sats = crate::total_anchor_channels_reserve_sats(
+			&self.channel_manager,
+			&self.chain_monitor,
+			&self.config,
+		);
 		let send_amount =
 			OnchainSendAmount::ExactRetainingReserve { amount_sats, cur_anchor_reserve_sats };
 		let fee_rate_opt = maybe_map_fee_rate_opt!(fee_rate);
@@ -115,8 +120,11 @@ impl OnchainPayment {
 		}
 
 		let send_amount = if retain_reserves {
-			let cur_anchor_reserve_sats =
-				crate::total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
+			let cur_anchor_reserve_sats = crate::total_anchor_channels_reserve_sats(
+				&self.channel_manager,
+				&self.chain_monitor,
+				&self.config,
+			);
 			OnchainSendAmount::AllRetainingReserve { cur_anchor_reserve_sats }
 		} else {
 			OnchainSendAmount::AllDrainingReserve
@@ -143,8 +151,11 @@ impl OnchainPayment {
 	pub fn bump_fee_rbf(
 		&self, payment_id: PaymentId, fee_rate: Option<FeeRate>,
 	) -> Result<Txid, Error> {
-		let cur_anchor_reserve_sats =
-			crate::total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
+		let cur_anchor_reserve_sats = crate::total_anchor_channels_reserve_sats(
+			&self.channel_manager,
+			&self.chain_monitor,
+			&self.config,
+		);
 		let fee_rate_opt = maybe_map_fee_rate_opt!(fee_rate);
 		self.wallet.bump_fee_rbf(payment_id, fee_rate_opt, cur_anchor_reserve_sats)
 	}

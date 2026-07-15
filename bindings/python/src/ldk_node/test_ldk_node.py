@@ -89,6 +89,26 @@ def wait_for_tx(esplora_endpoint, txid):
 
     raise Exception(f"Failed to confirm transaction {txid} after {max_attempts} attempts")
 
+def wait_for_outpoint_spend(esplora_endpoint, outpoint):
+    url = esplora_endpoint + "/tx/" + outpoint.txid + "/outspend/" + str(outpoint.vout)
+    attempts = 0
+    max_attempts = 30
+
+    while attempts < max_attempts:
+        try:
+            res = requests.get(url, timeout=10)
+            json = res.json()
+            if json.get('spent'):
+                return
+
+        except Exception as e:
+            print(f"Error: {e}")
+
+        attempts += 1
+        time.sleep(0.5)
+
+    raise Exception(f"Failed to confirm outpoint spend {outpoint} after {max_attempts} attempts")
+
 def send_to_address(address, amount_sats):
     amount_btc = amount_sats/100000000.0
     cmd = "sendtoaddress " + str(address) + " " + str(amount_btc)
@@ -174,6 +194,29 @@ def open_channel_and_wait_ready(node_1, node_2, node_id_2, listening_address_2, 
     channel_ready_event_1 = expect_event(node_1, Event.CHANNEL_READY)
     channel_ready_event_2 = expect_event(node_2, Event.CHANNEL_READY)
     return channel_ready_event_1, channel_ready_event_2, funding_txid
+
+def mine_channel_closure_until_spendable(nodes, esplora_endpoint):
+    blocks_to_mine = 0
+    for node in nodes:
+        current_height = node.status().current_best_block.height
+        balances = node.list_balances()
+        for lightning_balance in balances.lightning_balances:
+            confirmation_height = getattr(lightning_balance, "confirmation_height", None)
+            assert confirmation_height is not None, (
+                f"Unexpected balance after cooperative close: {lightning_balance}"
+            )
+            blocks_to_mine = max(blocks_to_mine, confirmation_height - current_height)
+
+    if blocks_to_mine > 0:
+        mine_and_wait(esplora_endpoint, blocks_to_mine)
+        for node in nodes:
+            node.sync_wallets()
+
+    for node in nodes:
+        balances = node.list_balances()
+        failure_message = f"Unexpected balances after cooperative close: {balances}"
+        assert len(balances.lightning_balances) == 0, failure_message
+        assert len(balances.pending_balances_from_channel_closures) == 0, failure_message
 
 def stop_and_cleanup(node_1, node_2, tmp_dir_1, tmp_dir_2):
     node_1.stop()
@@ -307,10 +350,14 @@ class TestLdkNode(unittest.TestCase):
 
         expect_event(node_2, Event.CHANNEL_CLOSED)
 
+        wait_for_outpoint_spend(esplora_endpoint, channel_ready_event_1.funding_txo)
+
         mine_and_wait(esplora_endpoint, 1)
 
         node_1.sync_wallets()
         node_2.sync_wallets()
+
+        mine_channel_closure_until_spendable([node_1, node_2], esplora_endpoint)
 
         spendable_balance_after_close_1 = node_1.list_balances().spendable_onchain_balance_sats
         assert spendable_balance_after_close_1 > 95000

@@ -55,6 +55,40 @@ fun mineAndWait(esploraEndpoint: String, blocks: UInt) {
     waitForBlock(esploraEndpoint, lastBlockHash)
 }
 
+fun mineChannelClosureUntilSpendable(esploraEndpoint: String, nodes: List<Node>) {
+    var blocksToMine = 0u
+    nodes.forEach { node ->
+        val currentHeight = node.status().currentBestBlock.height
+        node.listBalances().lightningBalances.forEach { balance ->
+            val confirmationHeight = when (balance) {
+                is LightningBalance.ClaimableAwaitingConfirmations -> balance.confirmationHeight
+                else -> error("Unexpected balance after cooperative close: $balance")
+            }
+            val blocksForNode =
+                if (confirmationHeight > currentHeight) {
+                    confirmationHeight - currentHeight
+                } else {
+                    0u
+                }
+            if (blocksForNode > blocksToMine) {
+                blocksToMine = blocksForNode
+            }
+        }
+    }
+
+    if (blocksToMine > 0u) {
+        mineAndWait(esploraEndpoint, blocksToMine)
+        nodes.forEach { it.syncWallets() }
+    }
+
+    nodes.forEach { node ->
+        val balances = node.listBalances()
+        val failureMessage = "Unexpected balances after cooperative close: $balances"
+        assertTrue(balances.lightningBalances.isEmpty(), failureMessage)
+        assertTrue(balances.pendingBalancesFromChannelClosures.isEmpty(), failureMessage)
+    }
+}
+
 fun sendToAddress(address: String, amountSats: UInt): String {
     val amountBtc = amountSats.toDouble() / 100000000.0
     val output = bitcoinCli("sendtoaddress", address, amountBtc.toString())
@@ -73,6 +107,23 @@ fun waitForTx(esploraEndpoint: String, txid: String) {
         val response = client.send(request, HttpResponse.BodyHandlers.ofString())
 
         esploraPickedUpTx = re.containsMatchIn(response.body())
+        Thread.sleep(500)
+    }
+}
+
+fun waitForOutpointSpend(esploraEndpoint: String, outpoint: OutPoint) {
+    var esploraPickedUpOutpointSpend = false
+    val re = Regex("\"spent\"\\s*:\\s*true")
+    while (!esploraPickedUpOutpointSpend) {
+        val client = HttpClient.newBuilder().build()
+        val url = esploraEndpoint + "/tx/" + outpoint.txid + "/outspend/" + outpoint.vout
+        val request = HttpRequest.newBuilder()
+            .uri(URI.create(url))
+            .build()
+
+        val response = client.send(request, HttpResponse.BodyHandlers.ofString())
+
+        esploraPickedUpOutpointSpend = re.containsMatchIn(response.body())
         Thread.sleep(500)
     }
 }
@@ -251,10 +302,12 @@ class LibraryTest {
         assert(channelPendingEvent2 is Event.ChannelPending)
         node2.eventHandled()
 
-        val fundingTxid = when (channelPendingEvent1) {
-            is Event.ChannelPending -> channelPendingEvent1.fundingTxo.txid
+        val fundingTxo = when (channelPendingEvent1) {
+            is Event.ChannelPending -> channelPendingEvent1.fundingTxo
             else -> return
         }
+
+        val fundingTxid = fundingTxo.txid
 
         waitForTx(esploraEndpoint, fundingTxid)
 
@@ -316,10 +369,14 @@ class LibraryTest {
         assert(channelClosedEvent2 is Event.ChannelClosed)
         node2.eventHandled()
 
+        waitForOutpointSpend(esploraEndpoint, fundingTxo)
+
         mineAndWait(esploraEndpoint, 1u)
 
         node1.syncWallets()
         node2.syncWallets()
+
+        mineChannelClosureUntilSpendable(esploraEndpoint, listOf(node1, node2))
 
         val spendableBalance1AfterClose = node1.listBalances().spendableOnchainBalanceSats
         val spendableBalance2AfterClose = node2.listBalances().spendableOnchainBalanceSats

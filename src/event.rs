@@ -55,7 +55,8 @@ use crate::payment::PaymentMetadata;
 use crate::probing::Prober;
 use crate::runtime::Runtime;
 use crate::types::{
-	CustomTlvRecord, DynStore, KeysManager, OnionMessenger, PaymentStore, Sweeper, Wallet,
+	ChainMonitor, CustomTlvRecord, DynStore, KeysManager, OnionMessenger, PaymentStore, Sweeper,
+	Wallet,
 };
 use crate::{
 	hex_utils, BumpTransactionEventHandler, ChannelManager, Error, Graph, PeerInfo, PeerStore,
@@ -530,6 +531,7 @@ where
 	wallet: Arc<Wallet>,
 	bump_tx_event_handler: Arc<BumpTransactionEventHandler>,
 	channel_manager: Arc<ChannelManager>,
+	chain_monitor: Arc<ChainMonitor>,
 	connection_manager: Arc<ConnectionManager<L>>,
 	output_sweeper: Arc<Sweeper>,
 	network_graph: Arc<Graph>,
@@ -553,19 +555,20 @@ where
 	pub fn new(
 		event_queue: Arc<EventQueue<L>>, wallet: Arc<Wallet>,
 		bump_tx_event_handler: Arc<BumpTransactionEventHandler>,
-		channel_manager: Arc<ChannelManager>, connection_manager: Arc<ConnectionManager<L>>,
-		output_sweeper: Arc<Sweeper>, network_graph: Arc<Graph>,
-		liquidity_source: Arc<LiquiditySource<Arc<Logger>>>, payment_store: Arc<PaymentStore>,
-		peer_store: Arc<PeerStore<L>>, keys_manager: Arc<KeysManager>,
-		static_invoice_store: Option<StaticInvoiceStore>, onion_messenger: Arc<OnionMessenger>,
-		om_mailbox: Option<Arc<OnionMessageMailbox>>, prober: Option<Arc<Prober>>,
-		runtime: Arc<Runtime>, logger: L, config: Arc<Config>,
+		channel_manager: Arc<ChannelManager>, chain_monitor: Arc<ChainMonitor>,
+		connection_manager: Arc<ConnectionManager<L>>, output_sweeper: Arc<Sweeper>,
+		network_graph: Arc<Graph>, liquidity_source: Arc<LiquiditySource<Arc<Logger>>>,
+		payment_store: Arc<PaymentStore>, peer_store: Arc<PeerStore<L>>,
+		keys_manager: Arc<KeysManager>, static_invoice_store: Option<StaticInvoiceStore>,
+		onion_messenger: Arc<OnionMessenger>, om_mailbox: Option<Arc<OnionMessageMailbox>>,
+		prober: Option<Arc<Prober>>, runtime: Arc<Runtime>, logger: L, config: Arc<Config>,
 	) -> Self {
 		Self {
 			event_queue,
 			wallet,
 			bump_tx_event_handler,
 			channel_manager,
+			chain_monitor,
 			connection_manager,
 			output_sweeper,
 			network_graph,
@@ -1276,6 +1279,7 @@ where
 				if required_reserve_sats > 0 {
 					let cur_anchor_reserve_sats = crate::total_anchor_channels_reserve_sats(
 						&self.channel_manager,
+						&self.chain_monitor,
 						&self.config,
 					);
 					let spendable_amount_sats =

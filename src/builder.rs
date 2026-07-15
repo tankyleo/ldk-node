@@ -2103,6 +2103,7 @@ fn build_with_store_internal(
 			Arc::clone(&wallet),
 			Arc::clone(&channel_manager),
 			Arc::clone(&keys_manager),
+			Arc::clone(&chain_monitor),
 			Arc::clone(&tx_broadcaster),
 			Arc::clone(&kv_store),
 			Arc::clone(&config),

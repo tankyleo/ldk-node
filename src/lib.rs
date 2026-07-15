@@ -109,6 +109,7 @@ mod types;
 mod util;
 mod wallet;
 
+use std::collections::HashSet;
 use std::default::Default;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -129,9 +130,9 @@ pub use builder::BuildError;
 pub use builder::NodeBuilder as Builder;
 use chain::ChainSource;
 use config::{
-	default_user_config, may_announce_channel, AsyncPaymentsRole, ChannelConfig, Config,
-	LNURL_AUTH_TIMEOUT_SECS, NODE_ANN_BCAST_INTERVAL, PEER_RECONNECTION_INTERVAL,
-	RGS_SYNC_INTERVAL,
+	default_user_config, may_announce_channel, AnchorChannelsConfig, AsyncPaymentsRole,
+	ChannelConfig, Config, LNURL_AUTH_TIMEOUT_SECS, NODE_ANN_BCAST_INTERVAL,
+	PEER_RECONNECTION_INTERVAL, RGS_SYNC_INTERVAL,
 };
 use connection::ConnectionManager;
 pub use error::Error as NodeError;
@@ -147,6 +148,7 @@ use gossip::GossipSource;
 use graph::NetworkGraph;
 use io::utils::update_and_persist_node_metrics;
 pub use lightning;
+use lightning::chain::chainmonitor::LockedChannelMonitor;
 use lightning::chain::BlockLocator;
 use lightning::impl_writeable_tlv_based;
 use lightning::ln::chan_utils::FUNDING_TRANSACTION_WITNESS_WEIGHT;
@@ -156,7 +158,7 @@ use lightning::ln::channelmanager::PaymentId;
 use lightning::ln::msgs::{BaseMessageHandler, SocketAddress};
 use lightning::ln::peer_handler::CustomMessageHandler;
 use lightning::routing::gossip::NodeAlias;
-use lightning::sign::EntropySource;
+use lightning::sign::{EntropySource, InMemorySigner};
 use lightning::util::persist::KVStore;
 use lightning::util::wallet_utils::{Input, Wallet as LdkWallet};
 use lightning_background_processor::process_events_async;
@@ -306,27 +308,19 @@ impl Node {
 			e
 		})?;
 
-		let manager_owns_any_0fc_channels =
-			self.channel_manager.list_channels().into_iter().any(|channel| {
-				channel
-					.channel_shutdown_state
-					.map_or(true, |s| s != ChannelShutdownState::ShutdownComplete)
-					&& channel
-						.channel_type
-						.as_ref()
-						.map_or(false, |c| c.requires_anchor_zero_fee_commitments())
-			});
-		let monitor_owns_any_0fc_channels =
-			self.chain_monitor.list_monitors().into_iter().any(|channel_id| {
-				self.chain_monitor
-					.get_monitor(channel_id)
-					.map(|monitor| {
-						monitor.channel_type_features().requires_anchor_zero_fee_commitments()
-					})
-					.unwrap_or(false)
-			});
-		let zero_fee_commitments_support_required = manager_owns_any_0fc_channels
-			|| monitor_owns_any_0fc_channels
+		let zero_fee_channel_count = channels_requiring_reserve_count(
+			&self.channel_manager,
+			&self.chain_monitor,
+			&self.config.anchor_channels_config,
+			// Do not count keyed anchor channel types
+			false,
+			// Do not count a channel if the type is not yet known to avoid requiring
+			// support for `submitpackage` in case ldk-node restarts in the middle of
+			// channel negotiation.
+			false,
+		);
+
+		let zero_fee_commitments_support_required = zero_fee_channel_count != 0
 			|| self.config.anchor_channels_config.enable_zero_fee_commitments;
 
 		// Block to ensure we update our fee rate cache once on startup.
@@ -655,6 +649,7 @@ impl Node {
 			Arc::clone(&self.wallet),
 			bump_tx_event_handler,
 			Arc::clone(&self.channel_manager),
+			Arc::clone(&self.chain_monitor),
 			Arc::clone(&self.connection_manager),
 			Arc::clone(&self.output_sweeper),
 			Arc::clone(&self.network_graph),
@@ -1104,6 +1099,7 @@ impl Node {
 		OnchainPayment::new(
 			Arc::clone(&self.wallet),
 			Arc::clone(&self.channel_manager),
+			Arc::clone(&self.chain_monitor),
 			Arc::clone(&self.config),
 			Arc::clone(&self.is_running),
 			Arc::clone(&self.logger),
@@ -1116,6 +1112,7 @@ impl Node {
 		Arc::new(OnchainPayment::new(
 			Arc::clone(&self.wallet),
 			Arc::clone(&self.channel_manager),
+			Arc::clone(&self.chain_monitor),
 			Arc::clone(&self.config),
 			Arc::clone(&self.is_running),
 			Arc::clone(&self.logger),
@@ -1305,8 +1302,11 @@ impl Node {
 			},
 			FundingAmount::Max => {
 				// Determine max funding amount from all available on-chain funds.
-				let cur_anchor_reserve_sats =
-					total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
+				let cur_anchor_reserve_sats = total_anchor_channels_reserve_sats(
+					&self.channel_manager,
+					&self.chain_monitor,
+					&self.config,
+				);
 				let new_channel_reserve =
 					self.new_channel_anchor_reserve_sats(&peer_info.node_id)?;
 				let total_anchor_reserve_sats = cur_anchor_reserve_sats + new_channel_reserve;
@@ -1410,8 +1410,11 @@ impl Node {
 		&self, amount_sats: u64, peer_node_id: &PublicKey, for_new_channel: bool,
 	) -> Result<(), Error> {
 		let action_str = if for_new_channel { "create channel" } else { "splice-in" };
-		let cur_anchor_reserve_sats =
-			total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
+		let cur_anchor_reserve_sats = total_anchor_channels_reserve_sats(
+			&self.channel_manager,
+			&self.chain_monitor,
+			&self.config,
+		);
 		let spendable_amount_sats =
 			self.wallet.get_spendable_amount_sats(cur_anchor_reserve_sats).unwrap_or(0);
 
@@ -1661,8 +1664,11 @@ impl Node {
 			let splice_amount_sats = match splice_amount_sats {
 				FundingAmount::Exact { amount_sats } => amount_sats,
 				FundingAmount::Max => {
-					let cur_anchor_reserve_sats =
-						total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
+					let cur_anchor_reserve_sats = total_anchor_channels_reserve_sats(
+						&self.channel_manager,
+						&self.chain_monitor,
+						&self.config,
+					);
 
 					const EMPTY_SCRIPT_SIG_WEIGHT: u64 =
 						1 /* empty script_sig */ * bitcoin::constants::WITNESS_SCALE_FACTOR as u64;
@@ -2130,8 +2136,11 @@ impl Node {
 
 	/// Retrieves an overview of all known balances.
 	pub fn list_balances(&self) -> BalanceDetails {
-		let cur_anchor_reserve_sats =
-			total_anchor_channels_reserve_sats(&self.channel_manager, &self.config);
+		let cur_anchor_reserve_sats = total_anchor_channels_reserve_sats(
+			&self.channel_manager,
+			&self.chain_monitor,
+			&self.config,
+		);
 		let (total_onchain_balance_sats, spendable_onchain_balance_sats) =
 			self.wallet.get_balances(cur_anchor_reserve_sats).unwrap_or((0, 0));
 
@@ -2453,22 +2462,85 @@ impl_writeable_tlv_based!(NodeMetrics, {
 });
 
 pub(crate) fn total_anchor_channels_reserve_sats(
-	channel_manager: &ChannelManager, config: &Config,
+	channel_manager: &ChannelManager, chain_monitor: &ChainMonitor, config: &Config,
 ) -> u64 {
-	channel_manager
-		.list_channels()
-		.into_iter()
-		.filter(|c| {
-			!config
-				.anchor_channels_config
-				.trusted_peers_no_reserve
-				.contains(&c.counterparty.node_id)
-				&& c.channel_shutdown_state
-					.map_or(true, |s| s != ChannelShutdownState::ShutdownComplete)
-				&& c.channel_type.as_ref().map_or(false, requires_anchor_channel_type)
-		})
-		.count() as u64
-		* config.anchor_channels_config.per_channel_reserve_sats
+	let count = channels_requiring_reserve_count(
+		channel_manager,
+		chain_monitor,
+		&config.anchor_channels_config,
+		true,
+		true,
+	);
+	count as u64 * config.anchor_channels_config.per_channel_reserve_sats
+}
+
+fn channels_requiring_reserve_count(
+	channel_manager: &ChannelManager, chain_monitor: &ChainMonitor,
+	anchor_channels_config: &AnchorChannelsConfig, count_keyed_anchor_type: bool,
+	count_if_type_not_yet_known: bool,
+) -> usize {
+	let mut channels_requiring_reserve = HashSet::new();
+
+	let feature_test = if count_keyed_anchor_type {
+		requires_anchor_channel_type
+	} else {
+		|features: &ChannelTypeFeatures| features.requires_anchor_zero_fee_commitments()
+	};
+
+	for channel_id in chain_monitor.list_monitors() {
+		let monitor = match chain_monitor.get_monitor(channel_id) {
+			Ok(monitor) => monitor,
+			Err(()) => continue,
+		};
+
+		if monitor_requires_anchor_reserve(monitor, anchor_channels_config, feature_test) {
+			channels_requiring_reserve.insert(channel_id);
+		}
+	}
+
+	for channel in channel_manager.list_channels() {
+		if channel_requires_anchor_reserve(
+			&channel,
+			anchor_channels_config,
+			feature_test,
+			count_if_type_not_yet_known,
+		) {
+			channels_requiring_reserve.insert(channel.channel_id);
+		}
+	}
+
+	channels_requiring_reserve.len()
+}
+
+fn monitor_requires_anchor_reserve<F: FnOnce(&ChannelTypeFeatures) -> bool>(
+	monitor: LockedChannelMonitor<'_, InMemorySigner>,
+	anchor_channels_config: &AnchorChannelsConfig, feature_test: F,
+) -> bool {
+	if !feature_test(&monitor.channel_type_features()) {
+		return false;
+	}
+
+	if monitor.get_claimable_balances().is_empty() {
+		return false;
+	}
+
+	let counterparty_node_id = monitor.get_counterparty_node_id();
+	if anchor_channels_config.trusted_peers_no_reserve.contains(&counterparty_node_id) {
+		return false;
+	}
+
+	return true;
+}
+
+fn channel_requires_anchor_reserve<F: FnOnce(&ChannelTypeFeatures) -> bool>(
+	channel: &LdkChannelDetails, anchor_channels_config: &AnchorChannelsConfig, feature_test: F,
+	count_if_type_not_yet_known: bool,
+) -> bool {
+	!anchor_channels_config.trusted_peers_no_reserve.contains(&channel.counterparty.node_id)
+		&& channel
+			.channel_shutdown_state
+			.map_or(true, |s| s != ChannelShutdownState::ShutdownComplete)
+		&& channel.channel_type.as_ref().map_or(count_if_type_not_yet_known, feature_test)
 }
 
 pub(crate) fn new_channel_anchor_reserve_sats(
