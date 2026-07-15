@@ -643,13 +643,18 @@ pub(crate) fn setup_two_nodes_with_store(
 	(node_a, node_b)
 }
 
+pub(crate) fn manual_esplora_sync_config() -> EsploraSyncConfig {
+	let mut sync_config = EsploraSyncConfig::default();
+	sync_config.background_sync_config = None;
+	sync_config
+}
+
 pub(crate) fn setup_node(chain_source: &TestChainSource, config: TestConfig) -> TestNode {
 	setup_builder!(builder, config.node_config);
 	match chain_source {
 		TestChainSource::Esplora(electrsd) => {
 			let esplora_url = format!("http://{}", electrsd.esplora_url.as_ref().unwrap());
-			let mut sync_config = EsploraSyncConfig::default();
-			sync_config.background_sync_config = None;
+			let mut sync_config = manual_esplora_sync_config();
 			sync_config.force_wallet_full_scan = config.force_wallet_full_scan;
 			if let Some(full_scan_stop_gap) = config.full_scan_stop_gap {
 				sync_config.full_scan_stop_gap = full_scan_stop_gap;

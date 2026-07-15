@@ -90,7 +90,10 @@ async fn build_migration_node(
 	esplora_url: &str,
 ) -> ldk_node::Node {
 	let mut builder = Builder::from_config(node_config);
-	builder.set_chain_source_esplora(esplora_url.to_string(), None);
+	builder.set_chain_source_esplora(
+		esplora_url.to_string(),
+		Some(common::manual_esplora_sync_config()),
+	);
 	with_opened_store!(instance, |store| builder.build_with_store(node_entropy, store).unwrap())
 }
 

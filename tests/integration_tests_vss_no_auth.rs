@@ -72,7 +72,7 @@ async fn vss_v0_schema_backwards_compatibility() {
 	let mut builder_new = Builder::new();
 	builder_new.set_network(bitcoin::Network::Regtest);
 	builder_new.set_storage_dir_path(storage_path);
-	builder_new.set_chain_source_esplora(esplora_url, None);
+	builder_new.set_chain_source_esplora(esplora_url, Some(common::manual_esplora_sync_config()));
 
 	let node_new = builder_new
 		.build_with_vss_store_and_fixed_headers(

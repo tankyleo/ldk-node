@@ -21,11 +21,11 @@ use common::{
 	expect_channel_pending_event, expect_channel_ready_event, expect_channel_ready_events,
 	expect_event, expect_payment_claimable_event, expect_payment_received_event,
 	expect_payment_successful_event, expect_splice_negotiated_event, generate_blocks_and_wait,
-	generate_listening_addresses, invalidate_blocks, open_channel, open_channel_push_amt,
-	open_channel_with_all, premine_and_distribute_funds, premine_blocks, prepare_rbf,
-	random_chain_source, random_config, setup_bitcoind_and_electrsd, setup_builder, setup_node,
-	setup_two_nodes, splice_in_with_all, wait_for_block, wait_for_tx, TestChainSource, TestConfig,
-	TestStoreType, TestSyncStore,
+	generate_listening_addresses, invalidate_blocks, manual_esplora_sync_config, open_channel,
+	open_channel_push_amt, open_channel_with_all, premine_and_distribute_funds, premine_blocks,
+	prepare_rbf, random_chain_source, random_config, setup_bitcoind_and_electrsd, setup_builder,
+	setup_node, setup_two_nodes, splice_in_with_all, wait_for_block, wait_for_tx, TestChainSource,
+	TestConfig, TestStoreType, TestSyncStore,
 };
 use electrsd::corepc_node::{self, Node as BitcoinD};
 use electrsd::ElectrsD;
@@ -3606,7 +3606,7 @@ async fn do_persistence_backwards_compatibility(version: OldLdkVersion) {
 	let mut builder_new = Builder::new();
 	builder_new.set_network(bitcoin::Network::Regtest);
 	builder_new.set_storage_dir_path(storage_path);
-	builder_new.set_chain_source_esplora(esplora_url, None);
+	builder_new.set_chain_source_esplora(esplora_url, Some(manual_esplora_sync_config()));
 
 	#[cfg(feature = "uniffi")]
 	let node_entropy = NodeEntropy::from_seed_bytes(seed_bytes.to_vec()).unwrap();
@@ -3655,7 +3655,7 @@ async fn fs_store_persistence_backwards_compatibility() {
 	let mut builder_new = Builder::new();
 	builder_new.set_network(bitcoin::Network::Regtest);
 	builder_new.set_storage_dir_path(storage_path);
-	builder_new.set_chain_source_esplora(esplora_url, None);
+	builder_new.set_chain_source_esplora(esplora_url, Some(manual_esplora_sync_config()));
 
 	#[cfg(feature = "uniffi")]
 	let node_entropy = NodeEntropy::from_seed_bytes(seed_bytes.to_vec()).unwrap();
