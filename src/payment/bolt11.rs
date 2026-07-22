@@ -9,8 +9,8 @@
 //!
 //! [BOLT 11]: https://github.com/lightning/bolts/blob/master/11-payment-encoding.md
 
-use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::collections::{HashSet, VecDeque};
+use std::sync::{Arc, Mutex, RwLock};
 
 use bitcoin::hashes::sha256::Hash as Sha256;
 use bitcoin::hashes::Hash;
@@ -24,7 +24,7 @@ use lightning::sign::EntropySource;
 use lightning_invoice::{
 	Bolt11Invoice as LdkBolt11Invoice, Bolt11InvoiceDescription as LdkBolt11InvoiceDescription,
 };
-use lightning_types::payment::{PaymentHash, PaymentPreimage, PaymentSecret};
+use lightning_types::payment::{PaymentHash, PaymentPreimage};
 
 use crate::config::{Config, LDK_PAYMENT_RETRY_TIMEOUT};
 use crate::connection::ConnectionManager;
@@ -37,10 +37,11 @@ use crate::payment::store::{
 	LSPS2Parameters, PaymentDetails, PaymentDetailsUpdate, PaymentDirection, PaymentKind,
 	PaymentStatus,
 };
-use crate::payment::{PendingPaymentDetails, PendingPaymentExpiry};
 use crate::peer_store::{PeerInfo, PeerStore};
 use crate::runtime::Runtime;
-use crate::types::{ChannelManager, KeysManager, PaymentStore, PendingPaymentStore};
+use crate::types::{ChannelManager, KeysManager, PaymentStore};
+
+const RECENT_MANUAL_BOLT11_INVOICE_HASH_LIMIT: usize = 1000;
 
 #[cfg(not(feature = "uniffi"))]
 type Bolt11Invoice = LdkBolt11Invoice;
@@ -62,6 +63,34 @@ impl_writeable_tlv_based!(PaymentMetadata, {
 	(0, lsps2_parameters, option),
 });
 
+pub(crate) struct ManualBolt11InvoiceHashCache {
+	payment_hashes: HashSet<PaymentHash>,
+	creation_order: VecDeque<PaymentHash>,
+}
+
+impl ManualBolt11InvoiceHashCache {
+	pub(crate) fn new() -> Self {
+		Self { payment_hashes: HashSet::new(), creation_order: VecDeque::new() }
+	}
+
+	fn reserve(&mut self, payment_hash: PaymentHash) -> bool {
+		self.payment_hashes.insert(payment_hash)
+	}
+
+	fn remember_created_invoice(&mut self, payment_hash: PaymentHash) {
+		self.creation_order.push_back(payment_hash);
+		while self.creation_order.len() > RECENT_MANUAL_BOLT11_INVOICE_HASH_LIMIT {
+			if let Some(expired_hash) = self.creation_order.pop_front() {
+				self.payment_hashes.remove(&expired_hash);
+			}
+		}
+	}
+
+	fn release(&mut self, payment_hash: PaymentHash) {
+		self.payment_hashes.remove(&payment_hash);
+	}
+}
+
 /// A payment handler allowing to create and pay [BOLT 11] invoices.
 ///
 /// Should be retrieved by calling [`Node::bolt11_payment`].
@@ -76,7 +105,7 @@ pub struct Bolt11Payment {
 	connection_manager: Arc<ConnectionManager<Arc<Logger>>>,
 	liquidity_source: Arc<LiquiditySource<Arc<Logger>>>,
 	payment_store: Arc<PaymentStore>,
-	pending_payment_store: Arc<PendingPaymentStore>,
+	manual_bolt11_invoice_hashes: Arc<Mutex<ManualBolt11InvoiceHashCache>>,
 	peer_store: Arc<PeerStore<Arc<Logger>>>,
 	config: Arc<Config>,
 	is_running: Arc<RwLock<bool>>,
@@ -88,8 +117,9 @@ impl Bolt11Payment {
 		runtime: Arc<Runtime>, channel_manager: Arc<ChannelManager>,
 		keys_manager: Arc<KeysManager>, connection_manager: Arc<ConnectionManager<Arc<Logger>>>,
 		liquidity_source: Arc<LiquiditySource<Arc<Logger>>>, payment_store: Arc<PaymentStore>,
-		pending_payment_store: Arc<PendingPaymentStore>, peer_store: Arc<PeerStore<Arc<Logger>>>,
-		config: Arc<Config>, is_running: Arc<RwLock<bool>>, logger: Arc<Logger>,
+		manual_bolt11_invoice_hashes: Arc<Mutex<ManualBolt11InvoiceHashCache>>,
+		peer_store: Arc<PeerStore<Arc<Logger>>>, config: Arc<Config>,
+		is_running: Arc<RwLock<bool>>, logger: Arc<Logger>,
 	) -> Self {
 		Self {
 			runtime,
@@ -98,7 +128,7 @@ impl Bolt11Payment {
 			connection_manager,
 			liquidity_source,
 			payment_store,
-			pending_payment_store,
+			manual_bolt11_invoice_hashes,
 			peer_store,
 			config,
 			is_running,
@@ -106,97 +136,34 @@ impl Bolt11Payment {
 		}
 	}
 
-	fn current_time_secs() -> u64 {
-		SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(Duration::from_secs(0)).as_secs()
-	}
-
-	fn prune_expired_pending_payments(&self) -> Result<(), Error> {
-		let now = Self::current_time_secs();
-		let current_height = self.channel_manager.current_best_block().height;
-		let expired_payment_ids = self
-			.pending_payment_store
-			.list_filter(|payment| payment.has_expired(now, current_height))
-			.into_iter()
-			.map(|payment| payment.details.id)
-			.collect::<Vec<_>>();
-
-		self.runtime.block_on(self.pending_payment_store.remove_batch(&expired_payment_ids))
-	}
-
-	fn pending_manual_claim_invoice(
-		payment_id: PaymentId, payment_hash: PaymentHash, amount_msat: Option<u64>,
-		payment_secret: Option<PaymentSecret>, expiry_secs: u32,
-	) -> PendingPaymentDetails {
-		let kind = PaymentKind::Bolt11 {
-			hash: payment_hash,
-			preimage: None,
-			secret: payment_secret,
-			counterparty_skimmed_fee_msat: None,
-		};
-		let payment = PaymentDetails::new(
-			payment_id,
-			kind,
-			amount_msat,
-			None,
-			PaymentDirection::Inbound,
-			PaymentStatus::Pending,
-		);
-		let timestamp = Self::current_time_secs().saturating_add(expiry_secs as u64);
-		let expiry = Some(PendingPaymentExpiry::Time { timestamp });
-		PendingPaymentDetails::new_with_expiry(payment, Vec::new(), expiry)
-	}
-
-	fn reserve_manual_claim_invoice(
-		&self, payment_hash: PaymentHash, amount_msat: Option<u64>, expiry_secs: u32,
-	) -> Result<PaymentId, Error> {
-		let payment_id = PaymentId(self.keys_manager.get_secure_random_bytes());
-		let pending_payment = Self::pending_manual_claim_invoice(
-			payment_id,
-			payment_hash,
-			amount_msat,
-			None,
-			expiry_secs,
-		);
-		if let Err(e) =
-			self.runtime.block_on(self.pending_payment_store.insert_manual_bolt11(pending_payment))
-		{
-			if e == Error::DuplicatePayment {
-				log_error!(self.logger, "Payment error: an invoice must not be paid twice.");
-			}
-			return Err(e);
+	fn reserve_manual_payment_hash(&self, payment_hash: PaymentHash) -> Result<(), Error> {
+		let mut payment_hashes = self.manual_bolt11_invoice_hashes.lock().expect("lock");
+		if payment_hashes.reserve(payment_hash) {
+			Ok(())
+		} else {
+			log_error!(self.logger, "Payment error: a payment hash must not be reused.");
+			Err(Error::DuplicatePayment)
 		}
-		Ok(payment_id)
 	}
 
-	fn register_manual_claim_invoice(
-		&self, payment_id: PaymentId, payment_hash: PaymentHash, amount_msat: Option<u64>,
-		payment_secret: PaymentSecret, expiry_secs: u32,
-	) -> Result<(), Error> {
-		let pending_payment = Self::pending_manual_claim_invoice(
-			payment_id,
-			payment_hash,
-			amount_msat,
-			Some(payment_secret),
-			expiry_secs,
-		);
-		self.runtime.block_on(self.pending_payment_store.insert_or_update(pending_payment))?;
-		Ok(())
+	fn remember_created_manual_invoice(&self, payment_hash: PaymentHash) {
+		self.manual_bolt11_invoice_hashes
+			.lock()
+			.expect("lock")
+			.remember_created_invoice(payment_hash);
 	}
 
-	fn remove_manual_claim_invoice(&self, payment_id: PaymentId) -> Result<(), Error> {
-		self.runtime.block_on(self.pending_payment_store.remove(&payment_id))
+	fn release_manual_payment_hash(&self, payment_hash: PaymentHash) {
+		self.manual_bolt11_invoice_hashes.lock().expect("lock").release(payment_hash);
 	}
 
 	pub(crate) fn receive_inner(
 		&self, amount_msat: Option<u64>, invoice_description: &LdkBolt11InvoiceDescription,
 		expiry_secs: u32, manual_claim_payment_hash: Option<PaymentHash>,
 	) -> Result<LdkBolt11Invoice, Error> {
-		let manual_claim_payment_id = if let Some(payment_hash) = manual_claim_payment_hash {
-			self.prune_expired_pending_payments()?;
-			Some(self.reserve_manual_claim_invoice(payment_hash, amount_msat, expiry_secs)?)
-		} else {
-			None
-		};
+		if let Some(payment_hash) = manual_claim_payment_hash {
+			self.reserve_manual_payment_hash(payment_hash)?;
+		}
 
 		let invoice = {
 			let invoice_params = Bolt11InvoiceParameters {
@@ -214,24 +181,16 @@ impl Bolt11Payment {
 				},
 				Err(e) => {
 					log_error!(self.logger, "Failed to create invoice: {}", e);
-					if let Some(payment_id) = manual_claim_payment_id {
-						self.remove_manual_claim_invoice(payment_id)?;
+					if let Some(payment_hash) = manual_claim_payment_hash {
+						self.release_manual_payment_hash(payment_hash);
 					}
 					return Err(Error::InvoiceCreationFailed);
 				},
 			}
 		};
 
-		if let (Some(payment_hash), Some(payment_id)) =
-			(manual_claim_payment_hash, manual_claim_payment_id)
-		{
-			self.register_manual_claim_invoice(
-				payment_id,
-				payment_hash,
-				amount_msat,
-				*invoice.payment_secret(),
-				expiry_secs,
-			)?;
+		if let Some(payment_hash) = manual_claim_payment_hash {
+			self.remember_created_manual_invoice(payment_hash);
 		}
 
 		Ok(invoice)
@@ -242,12 +201,9 @@ impl Bolt11Payment {
 		expiry_secs: u32, max_total_lsp_fee_limit_msat: Option<u64>,
 		max_proportional_lsp_fee_limit_ppm_msat: Option<u64>, payment_hash: Option<PaymentHash>,
 	) -> Result<LdkBolt11Invoice, Error> {
-		let manual_claim_payment_id = if let Some(payment_hash) = payment_hash {
-			self.prune_expired_pending_payments()?;
-			Some(self.reserve_manual_claim_invoice(payment_hash, amount_msat, expiry_secs)?)
-		} else {
-			None
-		};
+		if let Some(payment_hash) = payment_hash {
+			self.reserve_manual_payment_hash(payment_hash)?;
+		}
 
 		let connection_manager = Arc::clone(&self.connection_manager);
 		let res = self.runtime.block_on(async move {
@@ -279,26 +235,20 @@ impl Bolt11Payment {
 		let (invoice, chosen_lsp) = match res {
 			Ok(res) => res,
 			Err(e) => {
-				if let Some(payment_id) = manual_claim_payment_id {
-					self.remove_manual_claim_invoice(payment_id)?;
+				if let Some(payment_hash) = payment_hash {
+					self.release_manual_payment_hash(payment_hash);
 				}
 				return Err(e);
 			},
 		};
 
+		if let Some(payment_hash) = payment_hash {
+			self.remember_created_manual_invoice(payment_hash);
+		}
+
 		// Persist the chosen LSP peer to make sure we reconnect on restart.
 		let peer_info = PeerInfo { node_id: chosen_lsp.node_id, address: chosen_lsp.address };
 		self.runtime.block_on(self.peer_store.add_peer(peer_info))?;
-
-		if let (Some(payment_hash), Some(payment_id)) = (payment_hash, manual_claim_payment_id) {
-			self.register_manual_claim_invoice(
-				payment_id,
-				payment_hash,
-				amount_msat,
-				*invoice.payment_secret(),
-				expiry_secs,
-			)?;
-		}
 
 		Ok(invoice)
 	}
@@ -309,6 +259,12 @@ mod tests {
 	use lightning::util::ser::{Readable, Writeable};
 
 	use super::*;
+
+	fn payment_hash(n: u64) -> PaymentHash {
+		let mut bytes = [0; 32];
+		bytes[..8].copy_from_slice(&n.to_be_bytes());
+		PaymentHash(bytes)
+	}
 
 	#[test]
 	fn empty_metadata_roundtrips() {
@@ -332,6 +288,37 @@ mod tests {
 		let decoded = PaymentMetadata::read(&mut &*encoded).unwrap();
 
 		assert_eq!(metadata, decoded);
+	}
+
+	#[test]
+	fn manual_invoice_hash_cache_releases_failed_creation_reservations() {
+		let mut cache = ManualBolt11InvoiceHashCache::new();
+		let payment_hash = payment_hash(42);
+
+		assert!(cache.reserve(payment_hash));
+		assert!(!cache.reserve(payment_hash));
+
+		cache.release(payment_hash);
+		assert!(cache.reserve(payment_hash));
+	}
+
+	#[test]
+	fn manual_invoice_hash_cache_tracks_last_1000_created_invoices() {
+		let mut cache = ManualBolt11InvoiceHashCache::new();
+		let first_hash = payment_hash(0);
+
+		assert!(cache.reserve(first_hash));
+		cache.remember_created_invoice(first_hash);
+		assert!(!cache.reserve(first_hash));
+
+		for i in 1..=RECENT_MANUAL_BOLT11_INVOICE_HASH_LIMIT {
+			let payment_hash = payment_hash(i as u64);
+			assert!(cache.reserve(payment_hash));
+			cache.remember_created_invoice(payment_hash);
+		}
+
+		assert!(cache.reserve(first_hash));
+		assert!(!cache.reserve(payment_hash(RECENT_MANUAL_BOLT11_INVOICE_HASH_LIMIT as u64)));
 	}
 }
 
@@ -672,7 +659,6 @@ impl Bolt11Payment {
 		}
 
 		self.channel_manager.fail_htlc_backwards(&payment_hash);
-		self.runtime.block_on(self.pending_payment_store.remove(&payment_id))?;
 		Ok(())
 	}
 
@@ -695,9 +681,9 @@ impl Bolt11Payment {
 	/// the inbound payment arrives.
 	///
 	/// **Warning:** it is the user's responsibility to never reuse the same payment hash.
-	/// Reusing a payment hash is unsafe and can lead to loss of funds. We only reject duplicates
-	/// while a matching manual-claim invoice is still pending; we do not prevent reuse after the
-	/// pending registration has been claimed, failed, expired, or pruned.
+	/// Reusing a payment hash is unsafe and can lead to loss of funds. We reject duplicates
+	/// matching one of the last 1000 manual invoices generated during the current process, but
+	/// this best-effort check is not persisted across restarts.
 	///
 	/// **Note:** users *MUST* handle this event and claim the payment manually via
 	/// [`claim_for_id`] as soon as they have obtained access to the preimage of the given
@@ -736,9 +722,9 @@ impl Bolt11Payment {
 	/// the inbound payment arrives.
 	///
 	/// **Warning:** it is the user's responsibility to never reuse the same payment hash.
-	/// Reusing a payment hash is unsafe and can lead to loss of funds. We only reject duplicates
-	/// while a matching manual-claim invoice is still pending; we do not prevent reuse after the
-	/// pending registration has been claimed, failed, expired, or pruned.
+	/// Reusing a payment hash is unsafe and can lead to loss of funds. We reject duplicates
+	/// matching one of the last 1000 manual invoices generated during the current process, but
+	/// this best-effort check is not persisted across restarts.
 	///
 	/// **Note:** users *MUST* handle this event and claim the payment manually via
 	/// [`claim_for_id`] as soon as they have obtained access to the preimage of the given
@@ -796,9 +782,9 @@ impl Bolt11Payment {
 	/// is performed *before* emitting the event.
 	///
 	/// **Warning:** it is the user's responsibility to never reuse the same payment hash.
-	/// Reusing a payment hash is unsafe and can lead to loss of funds. We only reject duplicates
-	/// while a matching manual-claim invoice is still pending; we do not prevent reuse after the
-	/// pending registration has been claimed, failed, expired, or pruned.
+	/// Reusing a payment hash is unsafe and can lead to loss of funds. We reject duplicates
+	/// matching one of the last 1000 manual invoices generated during the current process, but
+	/// this best-effort check is not persisted across restarts.
 	///
 	/// **Note:** users *MUST* handle this event and claim the payment manually via
 	/// [`claim_for_id`] as soon as they have obtained access to the preimage of the given
@@ -868,9 +854,9 @@ impl Bolt11Payment {
 	/// is performed *before* emitting the event.
 	///
 	/// **Warning:** it is the user's responsibility to never reuse the same payment hash.
-	/// Reusing a payment hash is unsafe and can lead to loss of funds. We only reject duplicates
-	/// while a matching manual-claim invoice is still pending; we do not prevent reuse after the
-	/// pending registration has been claimed, failed, expired, or pruned.
+	/// Reusing a payment hash is unsafe and can lead to loss of funds. We reject duplicates
+	/// matching one of the last 1000 manual invoices generated during the current process, but
+	/// this best-effort check is not persisted across restarts.
 	///
 	/// **Note:** users *MUST* handle this event and claim the payment manually via
 	/// [`claim_for_id`] as soon as they have obtained access to the preimage of the given

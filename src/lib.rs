@@ -170,8 +170,8 @@ use logger::{log_debug, log_error, log_info, log_trace, LdkLogger, Logger};
 use payment::asynchronous::om_mailbox::OnionMessageMailbox;
 use payment::asynchronous::static_invoice_store::StaticInvoiceStore;
 use payment::{
-	Bolt11Payment, Bolt12Payment, OnchainPayment, PaymentDetails, SpontaneousPayment,
-	UnifiedPayment,
+	Bolt11Payment, Bolt12Payment, ManualBolt11InvoiceHashCache, OnchainPayment, PaymentDetails,
+	SpontaneousPayment, UnifiedPayment,
 };
 use peer_store::{PeerInfo, PeerStore};
 #[cfg(feature = "uniffi")]
@@ -181,8 +181,8 @@ use runtime::Runtime;
 pub use tokio;
 use types::{
 	Broadcaster, BumpTransactionEventHandler, ChainMonitor, ChannelManager, DynStore, Graph,
-	HRNResolver, KeysManager, OnionMessenger, PaymentStore, PeerManager, PendingPaymentStore,
-	Router, Scorer, Sweeper, Wallet,
+	HRNResolver, KeysManager, OnionMessenger, PaymentStore, PeerManager, Router, Scorer, Sweeper,
+	Wallet,
 };
 pub use types::{
 	ChannelCounterparty, ChannelDetails, CustomTlvRecord, PeerDetails, ReserveType, UserChannelId,
@@ -249,7 +249,7 @@ pub struct Node {
 	scorer: Arc<Mutex<Scorer>>,
 	peer_store: Arc<PeerStore<Arc<Logger>>>,
 	payment_store: Arc<PaymentStore>,
-	pending_payment_store: Arc<PendingPaymentStore>,
+	manual_bolt11_invoice_hashes: Arc<Mutex<ManualBolt11InvoiceHashCache>>,
 	lnurl_auth: Arc<LnurlAuth>,
 	is_running: Arc<RwLock<bool>>,
 	node_metrics: Arc<PersistedNodeMetrics>,
@@ -612,7 +612,6 @@ impl Node {
 			Arc::clone(&self.network_graph),
 			Arc::clone(&self.liquidity_source),
 			Arc::clone(&self.payment_store),
-			Arc::clone(&self.pending_payment_store),
 			Arc::clone(&self.peer_store),
 			Arc::clone(&self.keys_manager),
 			static_invoice_store,
@@ -965,7 +964,7 @@ impl Node {
 			Arc::clone(&self.connection_manager),
 			Arc::clone(&self.liquidity_source),
 			Arc::clone(&self.payment_store),
-			Arc::clone(&self.pending_payment_store),
+			Arc::clone(&self.manual_bolt11_invoice_hashes),
 			Arc::clone(&self.peer_store),
 			Arc::clone(&self.config),
 			Arc::clone(&self.is_running),
@@ -985,7 +984,7 @@ impl Node {
 			Arc::clone(&self.connection_manager),
 			Arc::clone(&self.liquidity_source),
 			Arc::clone(&self.payment_store),
-			Arc::clone(&self.pending_payment_store),
+			Arc::clone(&self.manual_bolt11_invoice_hashes),
 			Arc::clone(&self.peer_store),
 			Arc::clone(&self.config),
 			Arc::clone(&self.is_running),

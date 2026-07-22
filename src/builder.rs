@@ -74,6 +74,7 @@ use crate::lnurl_auth::LnurlAuth;
 use crate::logger::{log_error, LdkLogger, LogLevel, LogWriter, Logger};
 use crate::message_handler::NodeCustomMessageHandler;
 use crate::payment::asynchronous::om_mailbox::OnionMessageMailbox;
+use crate::payment::ManualBolt11InvoiceHashCache;
 use crate::peer_store::PeerStore;
 use crate::probing::{
 	HighDegreeStrategy, Prober, ProbingConfig, ProbingStrategy, ProbingStrategyKind,
@@ -2333,7 +2334,7 @@ fn build_with_store_internal(
 		scorer,
 		peer_store,
 		payment_store,
-		pending_payment_store,
+		manual_bolt11_invoice_hashes: Arc::new(Mutex::new(ManualBolt11InvoiceHashCache::new())),
 		lnurl_auth,
 		is_running,
 		node_metrics,

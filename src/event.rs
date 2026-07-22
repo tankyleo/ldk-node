@@ -10,7 +10,6 @@ use core::task::{Poll, Waker};
 use std::collections::VecDeque;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bitcoin::blockdata::locktime::absolute::LockTime;
 use bitcoin::secp256k1::PublicKey;
@@ -52,12 +51,11 @@ use crate::payment::asynchronous::static_invoice_store::StaticInvoiceStore;
 use crate::payment::store::{
 	PaymentDetails, PaymentDetailsUpdate, PaymentDirection, PaymentKind, PaymentStatus,
 };
-use crate::payment::{PaymentMetadata, PendingPaymentDetails, PendingPaymentExpiry};
+use crate::payment::PaymentMetadata;
 use crate::probing::Prober;
 use crate::runtime::Runtime;
 use crate::types::{
-	CustomTlvRecord, DynStore, KeysManager, OnionMessenger, PaymentStore, PendingPaymentStore,
-	Sweeper, Wallet,
+	CustomTlvRecord, DynStore, KeysManager, OnionMessenger, PaymentStore, Sweeper, Wallet,
 };
 use crate::{
 	hex_utils, BumpTransactionEventHandler, ChannelManager, Error, Graph, PeerInfo, PeerStore,
@@ -531,7 +529,6 @@ where
 	network_graph: Arc<Graph>,
 	liquidity_source: Arc<LiquiditySource<Arc<Logger>>>,
 	payment_store: Arc<PaymentStore>,
-	pending_payment_store: Arc<PendingPaymentStore>,
 	peer_store: Arc<PeerStore<L>>,
 	keys_manager: Arc<KeysManager>,
 	static_invoice_store: Option<StaticInvoiceStore>,
@@ -553,10 +550,10 @@ where
 		channel_manager: Arc<ChannelManager>, connection_manager: Arc<ConnectionManager<L>>,
 		output_sweeper: Arc<Sweeper>, network_graph: Arc<Graph>,
 		liquidity_source: Arc<LiquiditySource<Arc<Logger>>>, payment_store: Arc<PaymentStore>,
-		pending_payment_store: Arc<PendingPaymentStore>, peer_store: Arc<PeerStore<L>>,
-		keys_manager: Arc<KeysManager>, static_invoice_store: Option<StaticInvoiceStore>,
-		onion_messenger: Arc<OnionMessenger>, om_mailbox: Option<Arc<OnionMessageMailbox>>,
-		prober: Option<Arc<Prober>>, runtime: Arc<Runtime>, logger: L, config: Arc<Config>,
+		peer_store: Arc<PeerStore<L>>, keys_manager: Arc<KeysManager>,
+		static_invoice_store: Option<StaticInvoiceStore>, onion_messenger: Arc<OnionMessenger>,
+		om_mailbox: Option<Arc<OnionMessageMailbox>>, prober: Option<Arc<Prober>>,
+		runtime: Arc<Runtime>, logger: L, config: Arc<Config>,
 	) -> Self {
 		Self {
 			event_queue,
@@ -568,7 +565,6 @@ where
 			network_graph,
 			liquidity_source,
 			payment_store,
-			pending_payment_store,
 			peer_store,
 			keys_manager,
 			static_invoice_store,
@@ -611,50 +607,10 @@ where
 		})
 	}
 
-	fn current_time_secs() -> u64 {
-		SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or(Duration::from_secs(0)).as_secs()
-	}
-
-	async fn prune_expired_pending_payments(&self) -> Result<(), ReplayEvent> {
-		let now = Self::current_time_secs();
-		let current_height = self.channel_manager.current_best_block().height;
-		let expired_payment_ids = self
-			.pending_payment_store
-			.list_filter(|payment| payment.has_expired(now, current_height))
-			.into_iter()
-			.map(|payment| payment.details.id)
-			.collect::<Vec<_>>();
-
-		if let Err(e) = self.pending_payment_store.remove_batch(&expired_payment_ids).await {
-			log_error!(self.logger, "Failed to remove expired pending payments: {}", e);
-			return Err(ReplayEvent());
-		}
-
-		Ok(())
-	}
-
-	async fn find_pending_inbound_payment(
-		&self, payment_hash: &PaymentHash,
-	) -> Result<Option<PendingPaymentDetails>, ReplayEvent> {
-		self.prune_expired_pending_payments().await?;
-		Ok(self.pending_payment_store.get_pending_manual_bolt11_by_payment_hash(payment_hash))
-	}
-
 	fn resolve_inbound_payment_id(
 		&self, event_payment_id: PaymentId, payment_hash: &PaymentHash,
 	) -> (PaymentId, Option<PaymentDetails>) {
-		if let Some(info) = self.payment_store.get(&event_payment_id) {
-			return (event_payment_id, Some(info));
-		}
-
-		let legacy_id = PaymentId(payment_hash.0);
-		if legacy_id != event_payment_id {
-			if let Some(info) = self.payment_store.get(&legacy_id) {
-				return (legacy_id, Some(info));
-			}
-		}
-
-		(event_payment_id, None)
+		resolve_inbound_payment_id(&self.payment_store, event_payment_id, payment_hash)
 	}
 
 	pub async fn handle_event(&self, event: LdkEvent) -> Result<(), ReplayEvent> {
@@ -770,16 +726,8 @@ where
 				..
 			} => {
 				let event_payment_id = payment_id.unwrap_or(PaymentId(payment_hash.0));
-				let (mut payment_id, payment_info) =
+				let (payment_id, payment_info) =
 					self.resolve_inbound_payment_id(event_payment_id, &payment_hash);
-				let pending_payment = if payment_info.is_none() {
-					self.find_pending_inbound_payment(&payment_hash).await?
-				} else {
-					None
-				};
-				if let Some(pending_payment) = pending_payment.as_ref() {
-					payment_id = pending_payment.details.id;
-				}
 				if let Some(info) = payment_info.as_ref() {
 					if info.direction == PaymentDirection::Outbound {
 						log_info!(
@@ -865,17 +813,6 @@ where
 							counterparty_skimmed_fee_msat,
 						);
 						self.fail_claimable_payment(payment_id, &payment_hash).await?;
-						if pending_payment.is_some() {
-							if let Err(e) = self.pending_payment_store.remove(&payment_id).await {
-								log_error!(
-									self.logger,
-									"Failed to remove pending payment with ID {}: {}",
-									payment_id,
-									e
-								);
-								return Err(ReplayEvent());
-							}
-						}
 						return Ok(());
 					};
 
@@ -888,17 +825,6 @@ where
 							max_total_opening_fee_msat,
 						);
 						self.fail_claimable_payment(payment_id, &payment_hash).await?;
-						if pending_payment.is_some() {
-							if let Err(e) = self.pending_payment_store.remove(&payment_id).await {
-								log_error!(
-									self.logger,
-									"Failed to remove pending payment with ID {}: {}",
-									payment_id,
-									e
-								);
-								return Err(ReplayEvent());
-							}
-						}
 						return Ok(());
 					}
 
@@ -922,97 +848,70 @@ where
 					}
 				}
 
-				let payment_info = if let Some(pending_payment) = pending_payment.as_ref() {
-					let mut payment = pending_payment.details.clone();
-					if let PaymentKind::Bolt11 {
-						counterparty_skimmed_fee_msat: stored_fee, ..
-					} = &mut payment.kind
-					{
-						if counterparty_skimmed_fee_msat > 0 {
-							*stored_fee = Some(counterparty_skimmed_fee_msat);
+				if let PaymentPurpose::Bolt11InvoicePayment {
+					payment_preimage: None,
+					payment_secret,
+					..
+				} = &purpose
+				{
+					if payment_info.is_none() {
+						let kind = PaymentKind::Bolt11 {
+							hash: payment_hash,
+							preimage: None,
+							secret: Some(*payment_secret),
+							counterparty_skimmed_fee_msat: if counterparty_skimmed_fee_msat > 0 {
+								Some(counterparty_skimmed_fee_msat)
+							} else {
+								None
+							},
+						};
+						let payment = PaymentDetails::new(
+							payment_id,
+							kind,
+							Some(amount_msat),
+							None,
+							PaymentDirection::Inbound,
+							PaymentStatus::Pending,
+						);
+						match self.payment_store.insert(payment).await {
+							Ok(false) => (),
+							Ok(true) => {
+								log_error!(
+									self.logger,
+									"Bolt11InvoicePayment with ID {} was previously known",
+									payment_id,
+								);
+								debug_assert!(false);
+							},
+							Err(e) => {
+								log_error!(
+									self.logger,
+									"Failed to insert payment with ID {}: {}",
+									payment_id,
+									e
+								);
+								return Err(ReplayEvent());
+							},
 						}
 					}
 
-					match self.payment_store.insert(payment.clone()).await {
-						Ok(false) => (),
-						Ok(true) => {
-							log_error!(
-								self.logger,
-								"Bolt11InvoicePayment with ID {} was previously known",
-								payment_id,
-							);
-							debug_assert!(false);
-						},
+					let custom_records = onion_fields
+						.map(|cf| cf.custom_tlvs().into_iter().map(|tlv| tlv.into()).collect())
+						.unwrap_or_default();
+					let event = Event::PaymentClaimable {
+						payment_id,
+						payment_hash,
+						claimable_amount_msat: amount_msat,
+						claim_deadline,
+						custom_records,
+					};
+					match self.event_queue.add_event(event).await {
+						Ok(_) => return Ok(()),
 						Err(e) => {
-							log_error!(
-								self.logger,
-								"Failed to insert payment with ID {}: {}",
-								payment_id,
-								e
-							);
+							log_error!(self.logger, "Failed to push to event queue: {}", e);
 							return Err(ReplayEvent());
 						},
-					}
-
-					let mut pending_payment = pending_payment.clone();
-					pending_payment.expiry =
-						claim_deadline.map(|height| PendingPaymentExpiry::Height { height });
-					if let Err(e) =
-						self.pending_payment_store.insert_or_update(pending_payment).await
-					{
-						log_error!(
-							self.logger,
-							"Failed to update pending payment with ID {}: {}",
-							payment_id,
-							e
-						);
-						return Err(ReplayEvent());
-					}
-
-					Some(payment)
-				} else {
-					payment_info
-				};
-
-				if let Some(info) = payment_info.as_ref() {
-					// If this is known by the store but ChannelManager doesn't know the preimage,
-					// the payment has been registered via `_for_hash` variants and needs to be manually claimed via
-					// user interaction.
-					match &info.kind {
-						PaymentKind::Bolt11 { preimage, .. } => {
-							if purpose.preimage().is_none() {
-								debug_assert!(
-									preimage.is_none(),
-									"We would have registered the preimage if we knew"
-								);
-
-								let custom_records = onion_fields
-									.map(|cf| {
-										cf.custom_tlvs().into_iter().map(|tlv| tlv.into()).collect()
-									})
-									.unwrap_or_default();
-								let event = Event::PaymentClaimable {
-									payment_id,
-									payment_hash,
-									claimable_amount_msat: amount_msat,
-									claim_deadline,
-									custom_records,
-								};
-								match self.event_queue.add_event(event).await {
-									Ok(_) => return Ok(()),
-									Err(e) => {
-										log_error!(
-											self.logger,
-											"Failed to push to event queue: {}",
-											e
-										);
-										return Err(ReplayEvent());
-									},
-								};
-							}
-						},
-						_ => {},
-					}
+					};
 				}
 
 				log_info!(
@@ -1247,16 +1146,8 @@ where
 				onion_fields,
 			} => {
 				let event_payment_id = payment_id.unwrap_or(PaymentId(payment_hash.0));
-				let (mut payment_id, payment_info) =
+				let (payment_id, _) =
 					self.resolve_inbound_payment_id(event_payment_id, &payment_hash);
-				let pending_payment = if payment_info.is_none() {
-					self.find_pending_inbound_payment(&payment_hash).await?
-				} else {
-					None
-				};
-				if let Some(pending_payment) = pending_payment.as_ref() {
-					payment_id = pending_payment.details.id;
-				}
 				log_info!(
 					self.logger,
 					"Claimed payment with ID {} from payment hash {} of {}msat.",
@@ -1395,20 +1286,6 @@ where
 						return Err(ReplayEvent());
 					},
 				};
-
-				if pending_payment.is_some() {
-					if let Err(e) = self.pending_payment_store.remove(&payment_id).await {
-						log_error!(
-							self.logger,
-							"Failed to remove pending payment with ID {}: {}",
-							payment_id,
-							e
-						);
-						// The user-visible PaymentReceived event has already been durably queued.
-						// Replaying the LDK event here would risk queuing a duplicate event.
-						return Ok(());
-					}
-				}
 
 				return Ok(());
 			},
@@ -2257,6 +2134,44 @@ where
 	}
 }
 
+fn resolve_inbound_payment_id(
+	payment_store: &PaymentStore, event_payment_id: PaymentId, payment_hash: &PaymentHash,
+) -> (PaymentId, Option<PaymentDetails>) {
+	if let Some(info) = payment_store.get(&event_payment_id) {
+		return (event_payment_id, Some(info));
+	}
+
+	let legacy_id = PaymentId(payment_hash.0);
+	if legacy_id != event_payment_id {
+		if let Some(info) = payment_store.get(&legacy_id) {
+			return (legacy_id, Some(info));
+		}
+	}
+
+	// Manual BOLT11 payments persisted before we used LDK's inbound payment ID were stored
+	// under a node-generated ID. Keep those records tied to replayed LDK events after upgrade.
+	if let Some(info) = find_inbound_bolt11_payment_by_hash(payment_store, payment_hash) {
+		return (info.id, Some(info));
+	}
+
+	(event_payment_id, None)
+}
+
+fn find_inbound_bolt11_payment_by_hash(
+	payment_store: &PaymentStore, payment_hash: &PaymentHash,
+) -> Option<PaymentDetails> {
+	payment_store
+		.list_filter(|payment| {
+			payment.direction == PaymentDirection::Inbound
+				&& matches!(
+					&payment.kind,
+					PaymentKind::Bolt11 { hash, .. } if hash == payment_hash
+				)
+		})
+		.into_iter()
+		.next()
+}
+
 #[cfg(test)]
 mod tests {
 	use std::collections::VecDeque;
@@ -2318,6 +2233,45 @@ mod tests {
 			),
 			None
 		);
+	}
+
+	#[test]
+	fn inbound_payment_id_resolution_finds_previously_stored_manual_bolt11_payments() {
+		let store: Arc<DynStore> = Arc::new(DynStoreWrapper(InMemoryStore::new()));
+		let logger = Arc::new(Logger::new_log_facade());
+		let payment_hash = PaymentHash([42; 32]);
+		let event_payment_id = PaymentId([43; 32]);
+		let previously_stored_payment_id = PaymentId([44; 32]);
+		let previously_stored_payment = PaymentDetails::new(
+			previously_stored_payment_id,
+			PaymentKind::Bolt11 {
+				hash: payment_hash,
+				preimage: None,
+				secret: None,
+				counterparty_skimmed_fee_msat: None,
+			},
+			Some(100_000),
+			None,
+			PaymentDirection::Inbound,
+			PaymentStatus::Pending,
+		);
+		let payment_store = PaymentStore::new(
+			vec![previously_stored_payment.clone()],
+			"payment_id_resolution_test_primary".to_string(),
+			"payment_id_resolution_test_secondary".to_string(),
+			store,
+			logger,
+		);
+
+		assert_eq!(
+			find_inbound_bolt11_payment_by_hash(&payment_store, &payment_hash),
+			Some(previously_stored_payment.clone())
+		);
+
+		let (payment_id, payment_info) =
+			resolve_inbound_payment_id(&payment_store, event_payment_id, &payment_hash);
+		assert_eq!(payment_id, previously_stored_payment_id);
+		assert_eq!(payment_info, Some(previously_stored_payment));
 	}
 
 	#[tokio::test]

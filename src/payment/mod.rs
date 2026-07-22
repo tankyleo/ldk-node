@@ -17,12 +17,10 @@ pub(crate) mod store;
 mod unified;
 
 pub use bolt11::Bolt11Payment;
-pub(crate) use bolt11::PaymentMetadata;
+pub(crate) use bolt11::{ManualBolt11InvoiceHashCache, PaymentMetadata};
 pub use bolt12::Bolt12Payment;
 pub use onchain::OnchainPayment;
-pub(crate) use pending_payment_store::{
-	FundingTxCandidate, PendingPaymentDetails, PendingPaymentExpiry, PendingPaymentStore,
-};
+pub(crate) use pending_payment_store::{FundingTxCandidate, PendingPaymentDetails};
 pub use spontaneous::SpontaneousPayment;
 pub use store::{
 	Channel, ConfirmationStatus, LSPS2Parameters, PaymentDetails, PaymentDirection, PaymentKind,

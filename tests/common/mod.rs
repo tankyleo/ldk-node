@@ -1456,6 +1456,15 @@ pub(crate) async fn do_channel_full_cycle<E: ElectrumApi>(
 	assert_eq!(manual_payment.direction, PaymentDirection::Inbound);
 	assert_eq!(manual_payment.amount_msat, Some(invoice_amount_3_msat));
 	assert!(matches!(&manual_payment.kind, PaymentKind::Bolt11 { .. }));
+	assert!(matches!(
+		node_b.bolt11_payment().receive_for_hash(
+			invoice_amount_3_msat,
+			&invoice_description.clone().into(),
+			9217,
+			manual_payment_hash,
+		),
+		Err(NodeError::DuplicatePayment)
+	));
 
 	// Test failing manually registered payments.
 	let invoice_amount_4_msat = 5_532_000;
