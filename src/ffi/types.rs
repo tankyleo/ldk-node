@@ -1879,6 +1879,26 @@ impl ChannelTypeFeatures {
 		self.inner.requires_taproot()
 	}
 
+	/// Whether this channel type advertises support for `option_scid_alias`.
+	pub fn supports_scid_privacy(&self) -> bool {
+		self.inner.supports_scid_privacy()
+	}
+
+	/// Whether this channel type requires `option_scid_alias`.
+	pub fn requires_scid_privacy(&self) -> bool {
+		self.inner.requires_scid_privacy()
+	}
+
+	/// Whether this channel type advertises support for `option_zeroconf`.
+	pub fn supports_zero_conf(&self) -> bool {
+		self.inner.supports_zero_conf()
+	}
+
+	/// Whether this channel type requires `option_zeroconf`.
+	pub fn requires_zero_conf(&self) -> bool {
+		self.inner.requires_zero_conf()
+	}
+
 	/// Whether this channel type advertises support for `option_zero_fee_commitments`.
 	pub fn supports_anchor_zero_fee_commitments(&self) -> bool {
 		self.inner.supports_anchor_zero_fee_commitments()
@@ -2268,6 +2288,27 @@ mod tests {
 		let wrapped_invoice = Bolt12Invoice { inner: ldk_invoice.clone() };
 
 		(ldk_invoice, wrapped_invoice)
+	}
+
+	#[test]
+	fn test_channel_type_feature_accessors() {
+		let mut optional = LdkChannelTypeFeatures::empty();
+		optional.set_scid_privacy_optional();
+		optional.set_zero_conf_optional();
+		let optional = ChannelTypeFeatures::from(optional);
+		assert!(optional.supports_scid_privacy());
+		assert!(!optional.requires_scid_privacy());
+		assert!(optional.supports_zero_conf());
+		assert!(!optional.requires_zero_conf());
+
+		let mut required = LdkChannelTypeFeatures::empty();
+		required.set_scid_privacy_required();
+		required.set_zero_conf_required();
+		let required = ChannelTypeFeatures::from(required);
+		assert!(required.supports_scid_privacy());
+		assert!(required.requires_scid_privacy());
+		assert!(required.supports_zero_conf());
+		assert!(required.requires_zero_conf());
 	}
 
 	#[test]
