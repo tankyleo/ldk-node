@@ -355,6 +355,55 @@ impl Node {
 			)
 		})?;
 
+		// Bind listeners before spawning background tasks so startup errors cannot leave loops
+		// running while the node is still marked stopped.
+		let listeners = if let Some(listening_addresses) = &self.config.listening_addresses {
+			let logger = Arc::clone(&self.logger);
+			let listening_addrs = listening_addresses.clone();
+			self.runtime.block_on(async move {
+				let mut bind_addrs = Vec::with_capacity(listening_addrs.len());
+
+				for listening_addr in &listening_addrs {
+					let resolved =
+						tokio::net::lookup_host(listening_addr.to_string()).await.map_err(|e| {
+							log_error!(
+								logger,
+								"Unable to resolve listening address: {:?}. Error details: {}",
+								listening_addr,
+								e,
+							);
+							Error::InvalidSocketAddress
+						})?;
+					bind_addrs.extend(resolved);
+				}
+
+				let mut listeners = Vec::new();
+
+				// Try to bind to all addresses
+				for addr in &bind_addrs {
+					match tokio::net::TcpListener::bind(addr).await {
+						Ok(listener) => {
+							log_trace!(logger, "Listener bound to {}", addr);
+							listeners.push(listener);
+						},
+						Err(e) => {
+							log_error!(
+								logger,
+								"Failed to bind to {}: {} - is something else already listening?",
+								addr,
+								e
+							);
+							return Err(Error::InvalidSocketAddress);
+						},
+					}
+				}
+
+				Ok(listeners)
+			})?
+		} else {
+			Vec::new()
+		};
+
 		// Spawn background task continuously syncing onchain, lightning, and fee rate cache.
 		let stop_sync_receiver = self.stop_sender.subscribe();
 		let chain_source = Arc::clone(&self.chain_source);
@@ -425,98 +474,52 @@ impl Node {
 			);
 		}
 
-		if let Some(listening_addresses) = &self.config.listening_addresses {
-			// Setup networking
-			let peer_manager_connection_handler = Arc::clone(&self.peer_manager);
-			let listening_logger = Arc::clone(&self.logger);
-
+		// Setup networking
+		let peer_manager_connection_handler = Arc::clone(&self.peer_manager);
+		let listening_logger = Arc::clone(&self.logger);
+		for listener in listeners {
 			let logger = Arc::clone(&listening_logger);
-			let listening_addrs = listening_addresses.clone();
-			let listeners = self.runtime.block_on(async move {
-				let mut bind_addrs = Vec::with_capacity(listening_addrs.len());
-
-				for listening_addr in &listening_addrs {
-					let resolved =
-						tokio::net::lookup_host(listening_addr.to_string()).await.map_err(|e| {
-							log_error!(
+			let peer_mgr = Arc::clone(&peer_manager_connection_handler);
+			let mut stop_listen = self.stop_sender.subscribe();
+			let runtime = Arc::clone(&self.runtime);
+			self.runtime.spawn_cancellable_background_task(async move {
+				loop {
+					tokio::select! {
+						_ = stop_listen.changed() => {
+							log_debug!(
 								logger,
-								"Unable to resolve listening address: {:?}. Error details: {}",
-								listening_addr,
-								e,
+								"Stopping listening to inbound connections."
 							);
-							Error::InvalidSocketAddress
-						})?;
-					bind_addrs.extend(resolved);
-				}
-
-				let mut listeners = Vec::new();
-
-				// Try to bind to all addresses
-				for addr in &bind_addrs {
-					match tokio::net::TcpListener::bind(addr).await {
-						Ok(listener) => {
-							log_trace!(logger, "Listener bound to {}", addr);
-							listeners.push(listener);
-						},
-						Err(e) => {
-							log_error!(
-								logger,
-								"Failed to bind to {}: {} - is something else already listening?",
-								addr,
-								e
-							);
-							return Err(Error::InvalidSocketAddress);
-						},
-					}
-				}
-
-				Ok(listeners)
-			})?;
-
-			for listener in listeners {
-				let logger = Arc::clone(&listening_logger);
-				let peer_mgr = Arc::clone(&peer_manager_connection_handler);
-				let mut stop_listen = self.stop_sender.subscribe();
-				let runtime = Arc::clone(&self.runtime);
-				self.runtime.spawn_cancellable_background_task(async move {
-					loop {
-						tokio::select! {
-							_ = stop_listen.changed() => {
-								log_debug!(
-									logger,
-									"Stopping listening to inbound connections."
-								);
-								break;
-							}
-							res = listener.accept() => {
-								let tcp_stream = match res {
-									Ok((tcp_stream, _)) => tcp_stream,
+							break;
+						}
+						res = listener.accept() => {
+							let tcp_stream = match res {
+								Ok((tcp_stream, _)) => tcp_stream,
+								Err(e) => {
+									log_error!(logger, "Failed to accept inbound connection: {}", e);
+									continue;
+								},
+							};
+							let peer_mgr = Arc::clone(&peer_mgr);
+							let logger = Arc::clone(&logger);
+							runtime.spawn_cancellable_background_task(async move {
+								let tcp_stream = match tcp_stream.into_std() {
+									Ok(tcp_stream) => tcp_stream,
 									Err(e) => {
-										log_error!(logger, "Failed to accept inbound connection: {}", e);
-										continue;
+										log_error!(logger, "Failed to convert inbound connection: {}", e);
+										return;
 									},
 								};
-								let peer_mgr = Arc::clone(&peer_mgr);
-								let logger = Arc::clone(&logger);
-								runtime.spawn_cancellable_background_task(async move {
-									let tcp_stream = match tcp_stream.into_std() {
-										Ok(tcp_stream) => tcp_stream,
-										Err(e) => {
-											log_error!(logger, "Failed to convert inbound connection: {}", e);
-											return;
-										},
-									};
-									lightning_net_tokio::setup_inbound(
-										Arc::clone(&peer_mgr),
-										tcp_stream,
-									)
-										.await;
-								});
-							}
+								lightning_net_tokio::setup_inbound(
+									Arc::clone(&peer_mgr),
+									tcp_stream,
+								)
+									.await;
+							});
 						}
 					}
-				});
-			}
+				}
+			});
 		}
 
 		// Regularly reconnect to persisted peers.
