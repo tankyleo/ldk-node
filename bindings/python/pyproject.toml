@@ -30,9 +30,6 @@ dev = ["requests"]
 [tool.hatch.build.targets.wheel]
 packages = ["src/ldk_node"]
 
-[tool.hatch.build.targets.sdist.force-include]
-"../../README.md" = "README.md"
-
 [tool.hatch.metadata.hooks.custom]
 
 [tool.hatch.build.hooks.custom]

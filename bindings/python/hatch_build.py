@@ -4,17 +4,24 @@ from hatchling.builders.hooks.plugin.interface import BuildHookInterface
 from hatchling.metadata.plugin.interface import MetadataHookInterface
 
 
+def get_readme_path(root):
+    readme_path = os.path.join(root, "README.md")
+    if os.path.isfile(readme_path):
+        return readme_path
+
+    return os.path.normpath(os.path.join(root, "..", "..", "README.md"))
+
+
 class CustomMetadataHook(MetadataHookInterface):
     def update(self, metadata):
-        readme_path = os.path.join(self.root, "README.md")
-        if not os.path.isfile(readme_path):
-            readme_path = os.path.normpath(os.path.join(self.root, "..", "..", "README.md"))
-
-        with open(readme_path, encoding="utf-8") as readme_file:
+        with open(get_readme_path(self.root), encoding="utf-8") as readme_file:
             metadata["readme"] = {"content-type": "text/markdown", "text": readme_file.read()}
 
 
 class CustomBuildHook(BuildHookInterface):
     def initialize(self, version, build_data):
+        if self.target_name == "sdist":
+            build_data["force_include"][get_readme_path(self.root)] = "README.md"
+
         build_data["pure_python"] = False
         build_data["infer_tag"] = True
