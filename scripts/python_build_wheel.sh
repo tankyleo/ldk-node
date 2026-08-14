@@ -127,7 +127,7 @@ trap cleanup EXIT
 echo "Building Python wheel from commit $(git rev-parse HEAD)"
 echo "Target: $(uname -s) $(uname -m)"
 
-uv tool run --from "cibuildwheel[uv]==$CIBUILDWHEEL_VERSION" cibuildwheel \
+uv tool run --python 3.11 --from "cibuildwheel[uv]==$CIBUILDWHEEL_VERSION" cibuildwheel \
 	bindings/python \
 	--config-file bindings/python/pyproject.toml \
 	--output-dir "$OUTPUT_DIR"
