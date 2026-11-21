@@ -20,7 +20,7 @@ use std::time::SystemTime;
 use bdk_wallet::descriptor::IntoWalletDescriptor;
 use bdk_wallet::signer::SignersContainer;
 use bdk_wallet::template::Bip84;
-use bdk_wallet::{KeychainKind, Wallet as BdkWallet};
+use bdk_wallet::{AsyncWalletPersister, KeychainKind, Wallet as BdkWallet};
 use bitcoin::bip32::{ChildNumber, Xpriv};
 use bitcoin::key::Secp256k1;
 use bitcoin::secp256k1::PublicKey;
@@ -1876,18 +1876,6 @@ fn build_with_store_internal(
 				return Err(BuildError::ChainTipFetchFailed);
 			}
 
-			let mut wallet = runtime
-				.block_on(async {
-					BdkWallet::create(descriptor, change_descriptor)
-						.network(config.network)
-						.create_wallet_async(&mut wallet_persister)
-						.await
-				})
-				.map_err(|e| {
-					log_error!(logger, "Failed to set up wallet: {}", e);
-					BuildError::WalletSetupFailed
-				})?;
-
 			// Decide which block (if any) to insert as the initial BDK checkpoint. If the
 			// bitcoind config provides a wallet rescan height, use the preceding block as the
 			// checkpoint so synchronization includes the requested height. Otherwise, use the
@@ -1944,6 +1932,16 @@ fn build_with_store_internal(
 				Some(_) => unreachable!("wallet rescans require the chain-bitcoind feature"),
 			};
 
+			// Stage the birthday before the first persistence so there is never a persisted
+			// genesis-only wallet awaiting a second write to record its intended checkpoint.
+			let mut wallet = BdkWallet::create(descriptor.clone(), change_descriptor.clone())
+				.network(config.network)
+				.create_wallet_no_persist()
+				.map_err(|e| {
+					log_error!(logger, "Failed to set up wallet: {}", e);
+					BuildError::WalletSetupFailed
+				})?;
+
 			if let Some(best_block) = checkpoint_block {
 				// Insert the checkpoint so BDK starts scanning from there instead of from
 				// genesis.
@@ -1958,14 +1956,33 @@ fn build_with_store_internal(
 					log_error!(logger, "Failed to apply checkpoint during wallet setup: {}", e);
 					BuildError::WalletSetupFailed
 				})?;
-				// Persist the checkpoint right away, as the wallet would otherwise reload at
-				// genesis if we're restarted before its first sync.
-				runtime.block_on(wallet.persist_async(&mut wallet_persister)).map_err(|e| {
-					log_error!(logger, "Failed to persist checkpoint during wallet setup: {}", e);
-					BuildError::WalletSetupFailed
-				})?;
 			}
-			wallet
+
+			let initial_change_set =
+				wallet.take_staged().expect("a new wallet must have staged changes");
+			runtime.block_on(async {
+				// The initial load above already initialized the persister and found no wallet.
+				AsyncWalletPersister::persist(&mut wallet_persister, &initial_change_set)
+					.await
+					.map_err(|e| {
+						log_error!(logger, "Failed to persist initial wallet state: {}", e);
+						BuildError::WalletSetupFailed
+					})?;
+
+				// BDK cannot wrap an existing in-memory wallet as a PersistedWallet. Reload
+				// from the persister's cached changeset to obtain the wrapper without more I/O.
+				BdkWallet::load()
+					.descriptor(KeychainKind::External, Some(descriptor))
+					.descriptor(KeychainKind::Internal, Some(change_descriptor))
+					.check_network(config.network)
+					.load_wallet_async(&mut wallet_persister)
+					.await
+					.map_err(|e| {
+						log_error!(logger, "Failed to load initial wallet state: {}", e);
+						BuildError::WalletSetupFailed
+					})
+					.map(|wallet| wallet.expect("the initial wallet state was just persisted"))
+			})?
 		},
 	};
 

@@ -400,6 +400,7 @@ impl PaginatedKVStore for WalletPersistGatedStore {
 #[derive(Clone)]
 struct NamespaceWriteFailingStore {
 	inner: Arc<InMemoryStore>,
+	write_attempts: Arc<AtomicUsize>,
 	primary_namespace: &'static str,
 	/// When set, only writes to this key in `primary_namespace` fail.
 	key: Option<&'static str>,
@@ -410,6 +411,7 @@ impl NamespaceWriteFailingStore {
 	fn new(primary_namespace: &'static str) -> Self {
 		Self {
 			inner: Arc::new(InMemoryStore::new()),
+			write_attempts: Arc::new(AtomicUsize::new(0)),
 			primary_namespace,
 			key: None,
 			failing: Arc::new(AtomicBool::new(false)),
@@ -439,9 +441,12 @@ impl KVStore for NamespaceWriteFailingStore {
 	) -> impl Future<Output = Result<(), lightning::io::Error>> + 'static + Send {
 		// The inner store writes as soon as it is asked, not when its future is polled, so a
 		// failing write is never asked for.
-		let fail = primary_namespace == self.primary_namespace
-			&& self.key.map_or(true, |k| k == key)
-			&& self.failing.load(Ordering::Acquire);
+		let matches =
+			primary_namespace == self.primary_namespace && self.key.map_or(true, |k| k == key);
+		if matches {
+			self.write_attempts.fetch_add(1, Ordering::AcqRel);
+		}
+		let fail = matches && self.failing.load(Ordering::Acquire);
 		let write = (!fail).then(|| {
 			KVStore::write(&*self.inner, primary_namespace, secondary_namespace, key, buf)
 		});
@@ -2930,13 +2935,16 @@ async fn build_fails_when_wallet_rescan_height_is_above_tip() {
 		Some(current_tip_height + 1),
 	);
 
-	match builder.build(entropy.into()) {
+	let store = NamespaceWriteFailingStore::new("bdk_wallet");
+	match builder.build_with_store(entropy.into(), store.clone()) {
 		Err(err) => {
 			assert_eq!(err, BuildError::WalletRescanHeightTooHigh);
 			assert_eq!(err.to_string(), "Wallet rescan height is above the current chain tip.");
 		},
 		Ok(_) => panic!("expected build to fail for future wallet rescan height"),
 	}
+	assert_eq!(store.write_attempts.load(Ordering::Acquire), 0);
+	assert!(KVStore::list(&store, "bdk_wallet", "").await.unwrap().is_empty());
 }
 
 #[cfg(feature = "chain-bitcoind")]
@@ -9864,6 +9872,7 @@ async fn lsps2_service_funding_fee_does_not_spend_anchor_reserve() {
 	payer_node.stop().unwrap();
 }
 
+#[cfg(feature = "chain-bitcoind")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn wallet_birthday_survives_restart_before_first_sync() {
 	let (bitcoind, electrsd) = setup_bitcoind_and_electrsd();
@@ -9887,24 +9896,36 @@ async fn wallet_birthday_survives_restart_before_first_sync() {
 	.await;
 	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 6).await;
 
-	let mut config = random_config();
-	config.node_entropy = node_entropy;
-	let build_node = || {
-		setup_builder!(builder, config.node_config);
-		configure_chain_source(&chain_source, &mut builder, &config);
-		builder.build(config.node_entropy.into()).unwrap()
-	};
+	let tip_height: u32 = bitcoind.client.get_blockchain_info().unwrap().blocks.try_into().unwrap();
+	for chain_source in
+		[TestChainSource::BitcoindRpcSync(&bitcoind), TestChainSource::BitcoindRestSync(&bitcoind)]
+	{
+		for rescan_height in [None, Some(tip_height), Some(0)] {
+			let mut config = random_config();
+			config.node_entropy = node_entropy;
+			config.wallet_rescan_from_height = rescan_height;
+			let store = NamespaceWriteFailingStore::new_for_key("bdk_wallet", "local_chain");
+			let build_node = || {
+				setup_builder!(builder, config.node_config);
+				configure_chain_source(&chain_source, &mut builder, &config);
+				builder.build_with_store(config.node_entropy.into(), store.clone()).unwrap()
+			};
 
-	// Build the node for the first time, but drop it before it ever syncs.
-	drop(build_node());
+			// Build and drop before any sync. The first local-chain write must already
+			// contain the birthday, with no intermediate genesis-only write.
+			drop(build_node());
+			assert_eq!(store.write_attempts.load(Ordering::Acquire), 1);
+			generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 1).await;
 
-	generate_blocks_and_wait(&bitcoind.client, &electrsd.client, 1).await;
+			let node = build_node();
+			assert_eq!(store.write_attempts.load(Ordering::Acquire), 1);
+			node.start().unwrap();
+			node.sync_wallets().unwrap();
 
-	let node = build_node();
-	node.start().unwrap();
-	node.sync_wallets().unwrap();
-
-	// A wallet that kept its birthday doesn't see the earlier payment.
-	assert_eq!(node.list_balances().total_onchain_balance_sats, 0);
-	node.stop().unwrap();
+			// Only an explicit rescan from genesis should find the earlier payment.
+			let expected_balance = if rescan_height == Some(0) { premine_amount_sat } else { 0 };
+			assert_eq!(node.list_balances().total_onchain_balance_sats, expected_balance);
+			node.stop().unwrap();
+		}
+	}
 }
